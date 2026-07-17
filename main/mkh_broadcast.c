@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// MK6 Broadcast Stage 1: proves the firmware can run a non-connectable BLE
-// advertisement on the same BTstack instance Bluepad32 already drives,
-// concurrently with the XWC (Xbox Wireless Controller) connection.
+// MK6 Broadcast. Stage 1 proved a non-connectable BLE advertisement can run
+// on the same BTstack instance Bluepad32 already drives, concurrently with
+// the XWC (Xbox Wireless Controller) connection. Stage 2 replaces the test
+// payload with the real Mould King 6.0 protocol (see mkh_protocol.h/.c):
+// broadcast the CONNECT telegram to switch a hub into Bluetooth mode, then
+// switch to repeating a CONTROL telegram. Hardcoded to device 0, channel 0,
+// full speed forward - not yet controller-driven.
 //
 // Coexistence note (verified against the vendored BTstack source,
 // components/btstack/src/hci.c): BTstack only disables advertising when
@@ -24,11 +28,20 @@
 // calls are safe to invoke without manually gating on
 // hci_can_send_command_packet_now() (that gating is only required for raw
 // hci_send_cmd() calls, which this module does not use).
+//
+// The "repeat the CONTROL telegram every ~100-200ms" requirement is met by
+// BLE's own hardware-level advertising interval (MKH_ADV_INTERVAL_UNITS
+// below) once the payload is set - no software repeat timer is needed for
+// steady-state. A single one-shot BTstack timer sequences the CONNECT ->
+// CONTROL switch on boot.
 
 #include "mkh_broadcast.h"
 
 #include <btstack.h>
+#include <stdio.h>
+#include <string.h>
 
+#include "mkh_protocol.h"
 #include "uni_log.h"
 
 // 160 * 0.625ms = 100ms advertising interval.
@@ -38,27 +51,101 @@
 // the ADV_NONCONN_IND decode and hci_cmd.c's hci_le_set_advertising_parameters).
 #define MKH_ADV_TYPE_NONCONN_IND 3
 
+// MK company ID (BrickController2 MKProtocol.ManufacturerID / Python
+// MouldKingHub.ManufacturerID = bytes([0xFF, 0xF0])), little-endian on air.
+#define MKH_COMPANY_ID_LO 0xF0
+#define MKH_COMPANY_ID_HI 0xFF
+
+// Hardcoded Stage 2 test target: device slot 0, channel 0, full forward.
+#define MKH_TEST_DEVICE_ID 0
+#define MKH_TEST_CHANNEL 0
+#define MKH_TEST_POWER 1.0f
+
+// How long to broadcast CONNECT before switching to CONTROL (a handful of
+// repeats at the ~100ms advertising interval).
+#define MKH_CONNECT_PHASE_MS 600
+
 static btstack_packet_callback_registration_t mkh_hci_event_callback_registration;
 static bool mkh_advertising_started = false;
+static btstack_timer_source_t mkh_connect_to_control_timer;
 
 static bd_addr_t mkh_null_addr = {0, 0, 0, 0, 0, 0};
 
-// AD structures: Flags + Manufacturer Specific Data carrying the
-// recognizable test payload 0xAA 0xBB 0xCC (company id 0xFFFF is the
-// "no assigned company" placeholder - this is a test broadcast only,
-// not a real Mould King telegram).
-static const uint8_t mkh_adv_data[] = {
-    0x02, BLUETOOTH_DATA_TYPE_FLAGS, 0x06,
-    0x06, BLUETOOTH_DATA_TYPE_MANUFACTURER_SPECIFIC_DATA, 0xFF, 0xFF, 0xAA, 0xBB, 0xCC,
-};
+// Advertising Data buffer: Flags AD + Manufacturer Specific Data AD. Must
+// be static - gap_advertisements_set_data stores the pointer, not a copy.
+#define MKH_ADV_BUF_LEN (3 + 4 + MKH_PAYLOAD_CONTROL_LEN)
+static uint8_t mkh_adv_buf[MKH_ADV_BUF_LEN];
 
-static void mkh_start_advertising(void) {
-    gap_advertisements_set_params(MKH_ADV_INTERVAL_UNITS, MKH_ADV_INTERVAL_UNITS, MKH_ADV_TYPE_NONCONN_IND, 0,
-                                   mkh_null_addr, 0x07 /* all 3 adv channels */, 0 /* no filter */);
-    gap_advertisements_set_data(sizeof(mkh_adv_data), (uint8_t*)mkh_adv_data);
+static void mkh_log_hex(const char* label, const uint8_t* data, size_t len) {
+    char hex[3 * MKH_PAYLOAD_CONTROL_LEN + 1];
+    size_t pos = 0;
+    for (size_t i = 0; i < len && pos + 3 < sizeof(hex); i++) {
+        int n = snprintf(hex + pos, sizeof(hex) - pos, "%02X ", data[i]);
+        if (n <= 0)
+            break;
+        pos += (size_t)n;
+    }
+    logi("MK6 Broadcast: %s (%u bytes): %s\n", label, (unsigned)len, hex);
+}
+
+static void mkh_set_adv_payload(const uint8_t* payload, size_t payload_len) {
+    size_t i = 0;
+    mkh_adv_buf[i++] = 0x02;
+    mkh_adv_buf[i++] = BLUETOOTH_DATA_TYPE_FLAGS;
+    mkh_adv_buf[i++] = 0x06;
+
+    mkh_adv_buf[i++] = (uint8_t)(1 + 2 + payload_len);
+    mkh_adv_buf[i++] = BLUETOOTH_DATA_TYPE_MANUFACTURER_SPECIFIC_DATA;
+    mkh_adv_buf[i++] = MKH_COMPANY_ID_LO;
+    mkh_adv_buf[i++] = MKH_COMPANY_ID_HI;
+    memcpy(&mkh_adv_buf[i], payload, payload_len);
+    i += payload_len;
+
+    gap_advertisements_set_data((uint8_t)i, mkh_adv_buf);
+}
+
+static void mkh_broadcast_control(btstack_timer_source_t* ts) {
+    (void)ts;
+
+    uint8_t telegram[MKH_TELEGRAM_CONTROL_LEN];
+    mkh_protocol_control_telegram_neutral(MKH_TEST_DEVICE_ID, telegram);
+    mkh_protocol_set_channel(telegram, MKH_TEST_CHANNEL, MKH_TEST_POWER);
+    mkh_log_hex("CONTROL raw telegram", telegram, sizeof(telegram));
+
+    uint8_t payload[MKH_PAYLOAD_CONTROL_LEN];
+    size_t payload_len = mkh_protocol_encrypt(telegram, sizeof(telegram), payload, sizeof(payload));
+    mkh_log_hex("CONTROL encrypted payload", payload, payload_len);
+
+    mkh_set_adv_payload(payload, payload_len);
+
+    logi("MK6 Broadcast: now repeating CONTROL telegram (device=%d, channel=%d, power=full-forward) at ~100ms\n",
+         MKH_TEST_DEVICE_ID, MKH_TEST_CHANNEL);
+}
+
+static void mkh_broadcast_connect(void) {
+    uint8_t telegram[MKH_TELEGRAM_CONNECT_LEN];
+    mkh_protocol_connect_telegram(telegram);
+    mkh_log_hex("CONNECT raw telegram", telegram, sizeof(telegram));
+
+    uint8_t payload[MKH_PAYLOAD_CONNECT_LEN];
+    size_t payload_len = mkh_protocol_encrypt(telegram, sizeof(telegram), payload, sizeof(payload));
+    mkh_log_hex("CONNECT encrypted payload", payload, payload_len);
+
+    mkh_set_adv_payload(payload, payload_len);
     gap_advertisements_enable(1);
 
-    logi("MK6 Broadcast: advertising STARTED (non-connectable, ~100ms interval, payload AA BB CC)\n");
+    logi("MK6 Broadcast: advertising STARTED, broadcasting CONNECT telegram for %dms before switching to CONTROL\n",
+         MKH_CONNECT_PHASE_MS);
+
+    btstack_run_loop_set_timer_handler(&mkh_connect_to_control_timer, &mkh_broadcast_control);
+    btstack_run_loop_set_timer(&mkh_connect_to_control_timer, MKH_CONNECT_PHASE_MS);
+    btstack_run_loop_add_timer(&mkh_connect_to_control_timer);
+}
+
+static void mkh_start(void) {
+    gap_advertisements_set_params(MKH_ADV_INTERVAL_UNITS, MKH_ADV_INTERVAL_UNITS, MKH_ADV_TYPE_NONCONN_IND, 0,
+                                   mkh_null_addr, 0x07 /* all 3 adv channels */, 0 /* no filter */);
+    mkh_broadcast_connect();
 }
 
 static void mkh_check_command_complete(const uint8_t* packet) {
@@ -86,7 +173,7 @@ static void mkh_broadcast_packet_handler(uint8_t packet_type, uint16_t channel, 
         case BTSTACK_EVENT_STATE:
             if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING && !mkh_advertising_started) {
                 mkh_advertising_started = true;
-                mkh_start_advertising();
+                mkh_start();
             }
             break;
 
