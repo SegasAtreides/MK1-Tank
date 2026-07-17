@@ -7,6 +7,10 @@
 #ifndef MKH_BROADCAST_H
 #define MKH_BROADCAST_H
 
+#include <stdbool.h>
+
+#include "mkh_protocol.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -16,6 +20,11 @@ extern "C" {
 // and before hci_power_control(HCI_POWER_ON) is issued (so no
 // BTSTACK_EVENT_STATE / HCI_STATE_WORKING transition is missed).
 void mkh_broadcast_init(void);
+
+// True for device slots this firmware is actively broadcasting
+// CONNECT/CONTROL telegrams to (index = MK6 device slot 0..2). The
+// dashboard's MKH 0/1/2 rows read this directly.
+extern bool mkh_hub_broadcasting[MKH_MK6_NUM_DEVICES];
 
 #ifdef __cplusplus
 }

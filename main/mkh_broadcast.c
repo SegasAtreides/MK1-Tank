@@ -5,7 +5,7 @@
 // the XWC (Xbox Wireless Controller) connection. Stage 2 replaces the test
 // payload with the real Mould King 6.0 protocol (see mkh_protocol.h/.c):
 // broadcast the CONNECT telegram to switch a hub into Bluetooth mode, then
-// switch to repeating a CONTROL telegram. Hardcoded to device 0, channel 0,
+// switch to repeating a CONTROL telegram. Hardcoded to device 0, port A,
 // full speed forward - not yet controller-driven.
 //
 // Coexistence note (verified against the vendored BTstack source,
@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "mkh_ports.h"
 #include "mkh_protocol.h"
 #include "uni_log.h"
 
@@ -56,9 +57,9 @@
 #define MKH_COMPANY_ID_LO 0xF0
 #define MKH_COMPANY_ID_HI 0xFF
 
-// Hardcoded Stage 2 test target: device slot 0, channel 0, full forward.
+// Hardcoded Stage 2 test target: device slot 0, port A, full forward.
 #define MKH_TEST_DEVICE_ID 0
-#define MKH_TEST_CHANNEL 0
+#define MKH_TEST_PORT MKH_PORT_A
 #define MKH_TEST_POWER 1.0f
 
 // How long to broadcast CONNECT before switching to CONTROL (a handful of
@@ -68,6 +69,9 @@
 static btstack_packet_callback_registration_t mkh_hci_event_callback_registration;
 static bool mkh_advertising_started = false;
 static btstack_timer_source_t mkh_connect_to_control_timer;
+
+// Definition for the extern declared in mkh_broadcast.h.
+bool mkh_hub_broadcasting[MKH_MK6_NUM_DEVICES] = {false};
 
 static bd_addr_t mkh_null_addr = {0, 0, 0, 0, 0, 0};
 
@@ -109,7 +113,7 @@ static void mkh_broadcast_control(btstack_timer_source_t* ts) {
 
     uint8_t telegram[MKH_TELEGRAM_CONTROL_LEN];
     mkh_protocol_control_telegram_neutral(MKH_TEST_DEVICE_ID, telegram);
-    mkh_protocol_set_channel(telegram, MKH_TEST_CHANNEL, MKH_TEST_POWER);
+    mkh_protocol_set_channel(telegram, MKH_TEST_PORT, MKH_TEST_POWER);
     mkh_log_hex("CONTROL raw telegram", telegram, sizeof(telegram));
 
     uint8_t payload[MKH_PAYLOAD_CONTROL_LEN];
@@ -118,8 +122,8 @@ static void mkh_broadcast_control(btstack_timer_source_t* ts) {
 
     mkh_set_adv_payload(payload, payload_len);
 
-    logi("MK6 Broadcast: now repeating CONTROL telegram (device=%d, channel=%d, power=full-forward) at ~100ms\n",
-         MKH_TEST_DEVICE_ID, MKH_TEST_CHANNEL);
+    logi("MK6 Broadcast: now repeating CONTROL telegram (device=%d, port=%c, power=full-forward) at ~100ms\n",
+         MKH_TEST_DEVICE_ID, mkh_port_letter(MKH_TEST_PORT));
 }
 
 static void mkh_broadcast_connect(void) {
@@ -133,6 +137,12 @@ static void mkh_broadcast_connect(void) {
 
     mkh_set_adv_payload(payload, payload_len);
     gap_advertisements_enable(1);
+
+    // Dashboard: device MKH_TEST_DEVICE_ID is now actively being broadcast
+    // to. Nothing currently stops broadcasting once started (no stop/idle
+    // trigger exists yet - that arrives with real controller-driven
+    // control), so there is no corresponding "set false" path yet.
+    mkh_hub_broadcasting[MKH_TEST_DEVICE_ID] = true;
 
     logi("MK6 Broadcast: advertising STARTED, broadcasting CONNECT telegram for %dms before switching to CONTROL\n",
          MKH_CONNECT_PHASE_MS);

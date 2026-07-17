@@ -8,6 +8,8 @@
 #include <Bluepad32.h>
 #include <Arduino_GFX_Library.h>
 
+#include "mkh_broadcast.h"
+
 //
 // Display (Waveshare ESP32-S3-Touch-LCD-2, ST7789 over SPI)
 // Stage 1: proof-of-life only.
@@ -51,9 +53,8 @@ static const uint16_t COLOR_GREEN = RGB565_GREEN;
 enum XwcState { XWC_DISCONNECTED, XWC_CONNECTING, XWC_ACTIVE };
 static XwcState xwcState = XWC_DISCONNECTED;
 
-// MKH 0/1/2 = Mould King hub broadcast state. Not wired to real BLE
-// advertising yet (that's a later stage) - stays false, so all three render red.
-static bool hubBroadcasting[3] = {false, false, false};
+// MKH 0/1/2 = Mould King hub broadcast state, owned by mkh_broadcast.c
+// (mkh_hub_broadcasting) - true for device slots being actively broadcast to.
 
 enum DashRow { ROW_XWC = 0, ROW_MKH0, ROW_MKH1, ROW_MKH2, ROW_UPTIME, ROW_COUNT };
 static const char* ROW_LABELS[ROW_COUNT] = {"XWC", "MKH 0", "MKH 1", "MKH 2", "UPTIME"};
@@ -141,7 +142,7 @@ static void initDashboard() {
     drawStatusDot(ROW_XWC, lastXwcColorDrawn);
 
     for (int i = 0; i < 3; i++) {
-        lastHubColorDrawn[i] = hubBroadcasting[i] ? COLOR_GREEN : COLOR_RED;
+        lastHubColorDrawn[i] = mkh_hub_broadcasting[i] ? COLOR_GREEN : COLOR_RED;
         drawStatusDot(ROW_MKH0 + i, lastHubColorDrawn[i]);
     }
 
@@ -158,7 +159,7 @@ static void updateDashboard() {
     }
 
     for (int i = 0; i < 3; i++) {
-        uint16_t hc = hubBroadcasting[i] ? COLOR_GREEN : COLOR_RED;
+        uint16_t hc = mkh_hub_broadcasting[i] ? COLOR_GREEN : COLOR_RED;
         if (hc != lastHubColorDrawn[i]) {
             lastHubColorDrawn[i] = hc;
             drawStatusDot(ROW_MKH0 + i, hc);
