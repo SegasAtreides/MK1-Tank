@@ -15,6 +15,9 @@
 #include <arduino_platform.h>
 #include <uni.h>
 
+// MK6 Broadcast Stage 1: non-connectable BLE advertising alongside XWC.
+#include "mkh_broadcast.h"
+
 //
 // Autostart
 //
@@ -34,6 +37,11 @@ int app_main(void) {
 
     // Configure BTstack for ESP32 VHCI Controller
     btstack_init();
+
+    // Register the MK6 broadcast HCI event handler now, before HCI is
+    // powered on below, so no BTSTACK_EVENT_STATE/HCI_STATE_WORKING
+    // transition is missed.
+    mkh_broadcast_init();
 
     // hci_dump_init(hci_dump_embedded_stdout_get_instance());
 
