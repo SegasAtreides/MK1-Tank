@@ -1,3 +1,6 @@
 [submodule "components/arduino"]
 	path = components/arduino
 	url = https://github.com/espressif/arduino-esp32.git
+[submodule "components/Arduino_GFX"]
+	path = components/Arduino_GFX
+	url = https://github.com/moononournation/Arduino_GFX.git

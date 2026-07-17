@@ -6,6 +6,175 @@
 
 #include <Arduino.h>
 #include <Bluepad32.h>
+#include <Arduino_GFX_Library.h>
+
+//
+// Display (Waveshare ESP32-S3-Touch-LCD-2, ST7789 over SPI)
+// Stage 1: proof-of-life only.
+//
+#define TFT_RST 0
+#define TFT_BL 1
+#define TFT_MOSI 38
+#define TFT_SCLK 39
+#define TFT_DC 42
+#define TFT_CS 45
+
+static Arduino_DataBus* displayBus =
+    new Arduino_ESP32SPI(TFT_DC, TFT_CS, TFT_SCLK, TFT_MOSI, GFX_NOT_DEFINED);
+// Native panel is 240x320 (portrait); rotation=1 renders it as 320x240 (landscape).
+static Arduino_GFX* display = new Arduino_ST7789(displayBus, TFT_RST, 1, true, 240, 320);
+
+//
+// Dashboard (Stage 2)
+//
+static const char* DASH_TITLE = "MK1 TANK OS v0.3.0";
+
+static const int16_t SCR_W = 320;
+static const int16_t SCR_H = 240;
+static const int16_t HEADER_H = 28;
+static const int16_t ROW_H = 36;
+static const int16_t ROW_GAP = 4;
+static const int16_t ROW_MARGIN = 6;
+static const int16_t ROW_START_Y = HEADER_H + ROW_GAP;
+
+static const uint16_t COLOR_BG = RGB565_BLACK;
+static const uint16_t COLOR_HEADER_BG = RGB565_NAVY;
+static const uint16_t COLOR_CARD_BG = RGB565(30, 30, 30);
+static const uint16_t COLOR_CARD_BORDER = RGB565(70, 70, 70);
+static const uint16_t COLOR_LABEL = RGB565_WHITE;
+static const uint16_t COLOR_RED = RGB565_RED;
+static const uint16_t COLOR_YELLOW = RGB565_YELLOW;
+static const uint16_t COLOR_GREEN = RGB565_GREEN;
+
+// XWC = the Xbox Wireless Controller connection, tracked from the real
+// Bluepad32 callbacks/data below (see onConnectedController / processControllers).
+enum XwcState { XWC_DISCONNECTED, XWC_CONNECTING, XWC_ACTIVE };
+static XwcState xwcState = XWC_DISCONNECTED;
+
+// MKH 0/1/2 = Mould King hub broadcast state. Not wired to real BLE
+// advertising yet (that's a later stage) - stays false, so all three render red.
+static bool hubBroadcasting[3] = {false, false, false};
+
+enum DashRow { ROW_XWC = 0, ROW_MKH0, ROW_MKH1, ROW_MKH2, ROW_UPTIME, ROW_COUNT };
+static const char* ROW_LABELS[ROW_COUNT] = {"XWC", "MKH 0", "MKH 1", "MKH 2", "UPTIME"};
+
+static uint16_t lastXwcColorDrawn = 0xFFFF;
+static uint16_t lastHubColorDrawn[3] = {0xFFFF, 0xFFFF, 0xFFFF};
+static uint32_t lastUptimeDrawnSec = 0xFFFFFFFF;
+
+static int16_t rowTop(int idx) {
+    return ROW_START_Y + idx * (ROW_H + ROW_GAP);
+}
+
+static int16_t textWidth(const char* s, uint8_t size) {
+    return (int16_t)strlen(s) * 6 * size;
+}
+
+static void drawHeader() {
+    display->fillRect(0, 0, SCR_W, HEADER_H, COLOR_HEADER_BG);
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(2);
+    int16_t x = (SCR_W - textWidth(DASH_TITLE, 2)) / 2;
+    display->setCursor(x, (HEADER_H - 16) / 2);
+    display->print(DASH_TITLE);
+}
+
+static void drawCardShell(int idx) {
+    int16_t y = rowTop(idx);
+    display->fillRoundRect(ROW_MARGIN, y, SCR_W - 2 * ROW_MARGIN, ROW_H, 6, COLOR_CARD_BG);
+    display->drawRoundRect(ROW_MARGIN, y, SCR_W - 2 * ROW_MARGIN, ROW_H, 6, COLOR_CARD_BORDER);
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(2);
+    display->setCursor(ROW_MARGIN + 10, y + (ROW_H - 16) / 2);
+    display->print(ROW_LABELS[idx]);
+}
+
+static void drawStatusDot(int idx, uint16_t color) {
+    int16_t y = rowTop(idx);
+    int16_t cx = SCR_W - ROW_MARGIN - 22;
+    int16_t cy = y + ROW_H / 2;
+    display->fillCircle(cx, cy, 10, color);
+}
+
+static uint16_t xwcColor() {
+    switch (xwcState) {
+        case XWC_ACTIVE:
+            return COLOR_GREEN;
+        case XWC_CONNECTING:
+            return COLOR_YELLOW;
+        default:
+            return COLOR_RED;
+    }
+}
+
+static void drawUptime(bool force) {
+    uint32_t totalSec = millis() / 1000;
+    if (!force && totalSec == lastUptimeDrawnSec)
+        return;
+    lastUptimeDrawnSec = totalSec;
+
+    uint32_t h = totalSec / 3600;
+    uint32_t m = (totalSec % 3600) / 60;
+    uint32_t s = totalSec % 60;
+    char buf[9];
+    snprintf(buf, sizeof(buf), "%02u:%02u:%02u", (unsigned)h, (unsigned)m, (unsigned)s);
+
+    int16_t y = rowTop(ROW_UPTIME);
+    int16_t valW = textWidth("00:00:00", 2);
+    int16_t valX = SCR_W - ROW_MARGIN - 10 - valW;
+    display->fillRect(valX, y + 4, valW, ROW_H - 8, COLOR_CARD_BG);
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(2);
+    display->setCursor(valX, y + (ROW_H - 16) / 2);
+    display->print(buf);
+}
+
+static void initDashboard() {
+    display->fillScreen(COLOR_BG);
+    drawHeader();
+
+    for (int i = 0; i < ROW_COUNT; i++) {
+        drawCardShell(i);
+    }
+
+    lastXwcColorDrawn = xwcColor();
+    drawStatusDot(ROW_XWC, lastXwcColorDrawn);
+
+    for (int i = 0; i < 3; i++) {
+        lastHubColorDrawn[i] = hubBroadcasting[i] ? COLOR_GREEN : COLOR_RED;
+        drawStatusDot(ROW_MKH0 + i, lastHubColorDrawn[i]);
+    }
+
+    drawUptime(true);
+}
+
+// Redraws only what changed since the last call - keeps status dots steady
+// (no per-packet flicker) and avoids repainting the whole screen every loop.
+static void updateDashboard() {
+    uint16_t c = xwcColor();
+    if (c != lastXwcColorDrawn) {
+        lastXwcColorDrawn = c;
+        drawStatusDot(ROW_XWC, c);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        uint16_t hc = hubBroadcasting[i] ? COLOR_GREEN : COLOR_RED;
+        if (hc != lastHubColorDrawn[i]) {
+            lastHubColorDrawn[i] = hc;
+            drawStatusDot(ROW_MKH0 + i, hc);
+        }
+    }
+
+    drawUptime(false);
+}
+
+static void initDisplay() {
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, HIGH);
+
+    display->begin();
+    initDashboard();
+}
 
 //
 // README FIRST, README FIRST, README FIRST
@@ -37,6 +206,10 @@ void onConnectedController(ControllerPtr ctl) {
                            properties.product_id);
             myControllers[i] = ctl;
             foundEmptySlot = true;
+            if (i == 0) {
+                // Dashboard: XWC just paired, no input received yet.
+                xwcState = XWC_CONNECTING;
+            }
             break;
         }
     }
@@ -53,6 +226,10 @@ void onDisconnectedController(ControllerPtr ctl) {
             Console.printf("CALLBACK: Controller disconnected from index=%d\n", i);
             myControllers[i] = nullptr;
             foundController = true;
+            if (i == 0) {
+                // Dashboard: XWC gone.
+                xwcState = XWC_DISCONNECTED;
+            }
             break;
         }
     }
@@ -251,6 +428,10 @@ void processBalanceBoard(ControllerPtr ctl) {
 void processControllers() {
     for (auto myController : myControllers) {
         if (myController && myController->isConnected() && myController->hasData()) {
+            if (myController->index() == 0) {
+                // Dashboard: XWC is streaming input.
+                xwcState = XWC_ACTIVE;
+            }
             if (myController->isGamepad()) {
                 processGamepad(myController);
             } else if (myController->isMouse()) {
@@ -268,6 +449,8 @@ void processControllers() {
 
 // Arduino setup function. Runs in CPU 1
 void setup() {
+    initDisplay();
+
     Console.printf("Firmware: %s\n", BP32.firmwareVersion());
     const uint8_t* addr = BP32.localBdAddress();
     Console.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
@@ -309,6 +492,8 @@ void loop() {
     bool dataUpdated = BP32.update();
     if (dataUpdated)
         processControllers();
+
+    updateDashboard();
 
     // The main loop must have some kind of "yield to lower priority task" event.
     // Otherwise, the watchdog will get triggered.
