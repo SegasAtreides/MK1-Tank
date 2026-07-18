@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pio run:*)",
+      "Bash(pio device monitor:*)",
+      "Bash(python*esptool*)",
+      "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
+      "Bash(git add:*)", "Bash(git commit:*)", "Bash(git tag:*)",
+      "Bash(grep:*)", "Bash(find:*)",
+      "Edit", "Write"
+    ],
+    "deny": [
+      "Edit(main/mkh_protocol.c)",
+      "Edit(main/mkh_protocol.h)",
+      "Bash(git push:*)"
+    ]
+  }
+}
