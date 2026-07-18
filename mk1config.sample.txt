@@ -1,0 +1,40 @@
+# MK1 Tank config - sample file.
+#
+# Copy this to the microSD card's root as /mk1config.txt (exact filename,
+# card root, not a subfolder). The firmware reads it once at boot only -
+# there is no hot-reload, so a card swap or edit requires a reboot to
+# take effect.
+#
+# If the card is absent, the mount fails, the file is missing, or a line
+# is malformed, the firmware logs the reason and falls back to its
+# compiled-in defaults for the affected port(s) - it never fails to boot
+# over a config problem.
+#
+# Format: one line per hub output port.
+#   HUB<n>_PORT_<letter> = <input> [invert=yes|no] [max=0-100] [curve=linear]
+#
+# HUB<n>: app-facing hub number, 1-3, matching the hub's own blue-flash
+#         LED blink count when you set its address (HUB1/2/3, not the
+#         internal protocol device slots 0/1/2).
+# PORT_<letter>: physical output port on the hub, A-F, matching the
+#         letters silkscreened on the hub.
+# <input>: which controller input drives this port. v1 supports:
+#         LSNS - XWC left stick Y axis
+#         RSNS - XWC right stick Y axis
+# invert: "yes" flips the input's sign before mapping (default: no).
+# max:    caps the output range as a percentage of full scale, applied
+#         symmetrically around neutral (default: 100).
+# curve:  reshapes the input->output response. v1 only implements
+#         "linear" (the default) - any other value is accepted but
+#         logged as unsupported and treated as linear.
+#
+# Lines starting with # are comments. Blank lines are ignored. Unknown
+# keys or malformed lines are logged and skipped - parsing continues
+# with the rest of the file.
+
+# Reproduces the compiled-in default mapping (v0.7.0 behavior):
+HUB1_PORT_A = LSNS invert=no max=100 curve=linear
+HUB2_PORT_A = RSNS invert=no max=100 curve=linear
+
+# Example of a reversed, range-limited port (commented out):
+# HUB1_PORT_B = LSNS invert=yes max=50 curve=linear

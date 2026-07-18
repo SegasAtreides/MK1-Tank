@@ -1,0 +1,16 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
+#
+# Replicates components/partition_table/partitions_singleapp_large_coredump.csv
+# (the table this project used implicitly via CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE
+# + CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH) exactly, then adds "storage" for
+# v0.8.0's LittleFS-based config file (see mkh_storage.h/.cpp).
+#
+# Total: 24K + 4K + 1500K + 64K + 128K = 1720K, well within the 4MB
+# CONFIG_ESPTOOLPY_FLASHSIZE_4MB ceiling (and the board's actual 8MB
+# physical flash).
+nvs,      data, nvs,     ,        0x6000,
+phy_init, data, phy,     ,        0x1000,
+factory,  app,  factory, ,        1500K,
+coredump, data, coredump,,        64K,
+storage,  data, littlefs,,        128K,

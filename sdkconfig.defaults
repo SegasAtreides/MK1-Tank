@@ -9,7 +9,15 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 CONFIG_ESP32_XTAL_FREQ_AUTO=y
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+#
+# Partition table (v0.8.0): custom table, see partitions.csv at project
+# root. Replicates the previous CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE +
+# CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH layout exactly (nvs, phy_init,
+# factory, coredump) and adds a "storage" LittleFS data partition for the
+# config file parser (see mkh_storage.h/.cpp).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # Bluetooh related
 CONFIG_BT_ENABLED=y

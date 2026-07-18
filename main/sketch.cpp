@@ -11,7 +11,9 @@
 #include <Arduino_GFX_Library.h>
 
 #include "mkh_broadcast.h"
+#include "mkh_config.h"
 #include "mkh_ports.h"
+#include "mkh_storage.h"
 
 //
 // Display (Waveshare ESP32-S3-Touch-LCD-2, ST7789 over SPI)
@@ -94,6 +96,16 @@ static void drawHeader() {
     int16_t x = (SCR_W - textWidth(DASH_TITLE, 2)) / 2;
     display->setCursor(x, (HEADER_H - 16) / 2);
     display->print(DASH_TITLE);
+
+    // v0.8.0 Step 1: config-source indicator. Minimal footprint - reuses
+    // spare header space at size 1 rather than adding a dashboard row.
+    // Config is read once at boot (no hot-reload), so this is drawn once
+    // here and never needs to be refreshed like the status dots.
+    const char* cfgLabel = mkh_config_source_is_file() ? "CFG:FS" : "CFG:DEF";
+    display->setTextSize(1);
+    int16_t cfgX = SCR_W - ROW_MARGIN - textWidth(cfgLabel, 1);
+    display->setCursor(cfgX, (HEADER_H - 8) / 2);
+    display->print(cfgLabel);
 }
 
 static void drawCardShell(int idx) {
@@ -539,6 +551,12 @@ void processControllers() {
 
 // Arduino setup function. Runs in CPU 1
 void setup() {
+    // v0.8.0 Step 0b: LittleFS storage foundation. Internal flash has no
+    // shared-bus constraint with the display (unlike the retired SD
+    // path - see mkh_sdcard.cpp), but this stays the first line of
+    // setup() to preserve the single-entry-point boot discipline.
+    mkh_storage_boot_read();
+
     initDisplay();
 
     Console.printf("Firmware: %s\n", BP32.firmwareVersion());
