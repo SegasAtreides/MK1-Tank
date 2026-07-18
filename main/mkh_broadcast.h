@@ -26,6 +26,16 @@ void mkh_broadcast_init(void);
 // dashboard's MKH 0/1/2 rows read this directly.
 extern bool mkh_hub_broadcasting[MKH_MK6_NUM_DEVICES];
 
+// Thread-safe setter for device 0's live channel values, read by the
+// broadcast timer when building each CONTROL telegram. port is a channel
+// index 0..5 (see mkh_ports.h for the A..F labels); value is the raw
+// telegram byte (0x00..0xFF, 0x80 = neutral), matching the wire format
+// directly. Safe to call from any task - internally serialized against
+// the broadcast timer's read via a mutex, since callers (e.g. a
+// Bluepad32 controller callback) run on a different FreeRTOS task than
+// the BTstack run loop that builds telegrams.
+void mkh_set_channel(int port, uint8_t value);
+
 #ifdef __cplusplus
 }
 #endif

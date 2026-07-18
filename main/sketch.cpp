@@ -4,11 +4,14 @@
 
 #include "sdkconfig.h"
 
+#include <math.h>
+
 #include <Arduino.h>
 #include <Bluepad32.h>
 #include <Arduino_GFX_Library.h>
 
 #include "mkh_broadcast.h"
+#include "mkh_ports.h"
 
 //
 // Display (Waveshare ESP32-S3-Touch-LCD-2, ST7789 over SPI)
@@ -193,6 +196,50 @@ static void initDisplay() {
 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
+//
+// MK6 stick mapping (v0.6.0 Step 2): XWC left stick Y -> device 0 port A.
+//
+// Bluepad32's axisY() range is approximately -511 (full up) .. 512 (full
+// down), 0 = center - verified against Bluepad32's own docs/examples
+// (https://bluepad32.readthedocs.io/, ricardoquesada/bluepad32-arduino
+// examples/Controller/Controller.ino), not assumed: UP IS NEGATIVE. We
+// want stick-up to mean "forward" (high output byte), so the mapping
+// below inverts sign accordingly.
+//
+// Deadzone is a firmware constant, not a config setting - this is the one
+// obvious place it lives.
+#define MKH_STICK_AXIS_MAGNITUDE 512
+#define MKH_STICK_DEADZONE_PERCENT 8
+
+// Maps a raw axisY() reading to a MK6 telegram byte (0x00..0xFF, 0x80 =
+// neutral). Continuous across the deadzone boundary (no output jump) and
+// hits 0xFF/0x00 exactly at Bluepad32's documented axis extremes.
+static uint8_t mkStickYToChannelByte(int32_t axisY) {
+    const int32_t deadzone = (MKH_STICK_AXIS_MAGNITUDE * MKH_STICK_DEADZONE_PERCENT) / 100;
+
+    if (axisY >= -deadzone && axisY <= deadzone) {
+        return 0x80;
+    }
+
+    bool forward = axisY < 0;  // up (negative) -> forward
+    int32_t magnitude = forward ? -axisY : axisY;
+    int32_t travel = MKH_STICK_AXIS_MAGNITUDE - deadzone;
+
+    float fraction = (float)(magnitude - deadzone) / (float)travel;
+    if (fraction > 1.0f)
+        fraction = 1.0f;
+
+    // 0x80..0xFF is a 127-wide span, 0x80..0x00 is a 128-wide span - scale
+    // each direction separately so the extremes land exactly on 0xFF/0x00.
+    float scale = forward ? 127.0f : 128.0f;
+    int value = 128 + (int)lroundf((forward ? 1.0f : -1.0f) * fraction * scale);
+    if (value > 0xFF)
+        value = 0xFF;
+    if (value < 0x00)
+        value = 0x00;
+    return (uint8_t)value;
+}
+
 // This callback gets called any time a new gamepad is connected.
 // Up to 4 gamepads can be connected at the same time.
 void onConnectedController(ControllerPtr ctl) {
@@ -230,6 +277,12 @@ void onDisconnectedController(ControllerPtr ctl) {
             if (i == 0) {
                 // Dashboard: XWC gone.
                 xwcState = XWC_DISCONNECTED;
+
+                // Failsafe: force every channel neutral so the hub doesn't
+                // keep coasting on the last value it heard.
+                for (int ch = 0; ch < MKH_MK6_NUM_CHANNELS; ch++) {
+                    mkh_set_channel(ch, 0x80);
+                }
             }
             break;
         }
@@ -325,6 +378,12 @@ void dumpBalanceBoard(ControllerPtr ctl) {
 }
 
 void processGamepad(ControllerPtr ctl) {
+    if (ctl->index() == 0) {
+        // XWC left stick Y -> device 0 port A (see mkStickYToChannelByte).
+        uint8_t channelByte = mkStickYToChannelByte(ctl->axisY());
+        mkh_set_channel(MKH_PORT_A, channelByte);
+    }
+
     // There are different ways to query whether a button is pressed.
     // By query each button individually:
     //  a(), b(), x(), y(), l1(), etc...

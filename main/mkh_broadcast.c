@@ -5,8 +5,9 @@
 // the XWC (Xbox Wireless Controller) connection. Stage 2 replaces the test
 // payload with the real Mould King 6.0 protocol (see mkh_protocol.h/.c):
 // broadcast the CONNECT telegram to switch a hub into Bluetooth mode, then
-// switch to repeating a CONTROL telegram. Hardcoded to device 0, port A,
-// full speed forward - not yet controller-driven.
+// switch to repeating a CONTROL telegram. v0.6.0 wires mkh_set_channel()
+// (see below) to the XWC left stick (see sketch.cpp) - device 0, port A,
+// live proportional control.
 //
 // Coexistence note (verified against the vendored BTstack source,
 // components/btstack/src/hci.c): BTstack only disables advertising when
@@ -29,11 +30,17 @@
 // hci_can_send_command_packet_now() (that gating is only required for raw
 // hci_send_cmd() calls, which this module does not use).
 //
-// The "repeat the CONTROL telegram every ~100-200ms" requirement is met by
-// BLE's own hardware-level advertising interval (MKH_ADV_INTERVAL_UNITS
-// below) once the payload is set - no software repeat timer is needed for
-// steady-state. A single one-shot BTstack timer sequences the CONNECT ->
-// CONTROL switch on boot.
+// Two things repeat at ~100ms, for different reasons. BLE's own
+// hardware-level advertising interval (MKH_ADV_INTERVAL_UNITS below)
+// re-transmits whatever payload is currently set - that's "free" and
+// needs no software timer. Separately, mkh_broadcast_control() itself
+// re-arms on a ~100ms BTstack timer (MKH_CONTROL_REPEAT_MS) so it keeps
+// rebuilding the payload from the live, controller-driven channel values
+// (mkh_channel_value[], set via mkh_set_channel()) - without that, the
+// broadcast would freeze at whatever value happened to be current the one
+// time the timer fired. gap_advertisements_set_data() only stages new
+// advertising *data*, not parameters, so calling it every cycle does not
+// stop/restart advertising (see mkh_broadcast_control()).
 
 #include "mkh_broadcast.h"
 
@@ -41,6 +48,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "mkh_ports.h"
 #include "mkh_protocol.h"
 #include "uni_log.h"
@@ -57,21 +66,42 @@
 #define MKH_COMPANY_ID_LO 0xF0
 #define MKH_COMPANY_ID_HI 0xFF
 
-// Hardcoded Stage 2 test target: device slot 0, port A, full forward.
+// Hardcoded v0.6.0 target device slot: 0. Channel values are live, driven
+// by mkh_set_channel() from real controller input (see sketch.cpp).
 #define MKH_TEST_DEVICE_ID 0
-#define MKH_TEST_PORT MKH_PORT_A
-#define MKH_TEST_POWER 1.0f
 
 // How long to broadcast CONNECT before switching to CONTROL (a handful of
 // repeats at the ~100ms advertising interval).
 #define MKH_CONNECT_PHASE_MS 600
 
+// How often mkh_broadcast_control() re-arms itself to rebuild the CONTROL
+// telegram from live channel values - see the file header comment.
+#define MKH_CONTROL_REPEAT_MS 100
+
 static btstack_packet_callback_registration_t mkh_hci_event_callback_registration;
 static bool mkh_advertising_started = false;
-static btstack_timer_source_t mkh_connect_to_control_timer;
+static btstack_timer_source_t mkh_broadcast_timer;
 
 // Definition for the extern declared in mkh_broadcast.h.
 bool mkh_hub_broadcasting[MKH_MK6_NUM_DEVICES] = {false};
+
+// Live per-channel raw telegram byte values for device 0 (0x80 = neutral),
+// set via mkh_set_channel() and read by mkh_broadcast_control() when
+// building each CONTROL telegram. Protected by mkh_channel_mutex since the
+// setter and the broadcast timer run on different FreeRTOS tasks.
+// Explicitly initialized to 0x80 - a plain zero-init would default to
+// 0x00 (full reverse), not neutral.
+static uint8_t mkh_channel_value[MKH_MK6_NUM_CHANNELS] = {0x80, 0x80, 0x80, 0x80, 0x80, 0x80};
+static SemaphoreHandle_t mkh_channel_mutex;
+
+void mkh_set_channel(int port, uint8_t value) {
+    if (port < 0 || port >= MKH_MK6_NUM_CHANNELS)
+        return;
+
+    xSemaphoreTake(mkh_channel_mutex, portMAX_DELAY);
+    mkh_channel_value[port] = value;
+    xSemaphoreGive(mkh_channel_mutex);
+}
 
 static bd_addr_t mkh_null_addr = {0, 0, 0, 0, 0, 0};
 
@@ -108,22 +138,58 @@ static void mkh_set_adv_payload(const uint8_t* payload, size_t payload_len) {
     gap_advertisements_set_data((uint8_t)i, mkh_adv_buf);
 }
 
+// Last-logged snapshot, so the (verbose) per-telegram log only prints when
+// a channel value actually changes, not on every ~100ms refresh cycle.
+static uint8_t mkh_last_logged_values[MKH_MK6_NUM_CHANNELS];
+static bool mkh_control_logged_once = false;
+
 static void mkh_broadcast_control(btstack_timer_source_t* ts) {
-    (void)ts;
+    uint8_t values[MKH_MK6_NUM_CHANNELS];
+    xSemaphoreTake(mkh_channel_mutex, portMAX_DELAY);
+    memcpy(values, mkh_channel_value, sizeof(values));
+    xSemaphoreGive(mkh_channel_mutex);
 
     uint8_t telegram[MKH_TELEGRAM_CONTROL_LEN];
     mkh_protocol_control_telegram_neutral(MKH_TEST_DEVICE_ID, telegram);
-    mkh_protocol_set_channel(telegram, MKH_TEST_PORT, MKH_TEST_POWER);
-    mkh_log_hex("CONTROL raw telegram", telegram, sizeof(telegram));
+
+    bool changed = !mkh_control_logged_once || memcmp(values, mkh_last_logged_values, sizeof(values)) != 0;
+
+    char ports_log[MKH_MK6_NUM_CHANNELS * 8 + 1];
+    size_t pos = 0;
+    for (int ch = 0; ch < MKH_MK6_NUM_CHANNELS; ch++) {
+        // Raw byte (0x00..0xFF, 0x80=neutral) -> power (-1.0..1.0), the
+        // unit mkh_protocol_set_channel expects. Exact at the boundaries
+        // (0x00, 0x80, 0xFF); mkh_protocol.c itself is untouched.
+        float power = ((float)values[ch] - 128.0f) / 128.0f;
+        mkh_protocol_set_channel(telegram, ch, power);
+
+        if (changed) {
+            int n = snprintf(ports_log + pos, sizeof(ports_log) - pos, "%c=%02X ", mkh_port_letter(ch), values[ch]);
+            if (n > 0)
+                pos += (size_t)n;
+        }
+    }
 
     uint8_t payload[MKH_PAYLOAD_CONTROL_LEN];
     size_t payload_len = mkh_protocol_encrypt(telegram, sizeof(telegram), payload, sizeof(payload));
-    mkh_log_hex("CONTROL encrypted payload", payload, payload_len);
-
     mkh_set_adv_payload(payload, payload_len);
 
-    logi("MK6 Broadcast: now repeating CONTROL telegram (device=%d, port=%c, power=full-forward) at ~100ms\n",
-         MKH_TEST_DEVICE_ID, mkh_port_letter(MKH_TEST_PORT));
+    if (changed) {
+        mkh_log_hex("CONTROL raw telegram", telegram, sizeof(telegram));
+        mkh_log_hex("CONTROL encrypted payload", payload, payload_len);
+        logi("MK6 Broadcast: CONTROL telegram updated (device=%d), ports: %s\n", MKH_TEST_DEVICE_ID, ports_log);
+        memcpy(mkh_last_logged_values, values, sizeof(values));
+        mkh_control_logged_once = true;
+    }
+
+    // Re-arm: rebuild from live channel values every ~100ms so stick
+    // movement is reflected promptly. gap_advertisements_set_data() only
+    // stages new advertising *data* (not parameters), which BTstack sends
+    // without stopping/restarting advertising - confirmed against
+    // components/btstack/src/hci.c: the stop-before-reconfigure path is
+    // gated on LE_ADVERTISEMENT_TASKS_SET_PARAMS, not SET_ADV_DATA.
+    btstack_run_loop_set_timer(ts, MKH_CONTROL_REPEAT_MS);
+    btstack_run_loop_add_timer(ts);
 }
 
 static void mkh_broadcast_connect(void) {
@@ -147,9 +213,9 @@ static void mkh_broadcast_connect(void) {
     logi("MK6 Broadcast: advertising STARTED, broadcasting CONNECT telegram for %dms before switching to CONTROL\n",
          MKH_CONNECT_PHASE_MS);
 
-    btstack_run_loop_set_timer_handler(&mkh_connect_to_control_timer, &mkh_broadcast_control);
-    btstack_run_loop_set_timer(&mkh_connect_to_control_timer, MKH_CONNECT_PHASE_MS);
-    btstack_run_loop_add_timer(&mkh_connect_to_control_timer);
+    btstack_run_loop_set_timer_handler(&mkh_broadcast_timer, &mkh_broadcast_control);
+    btstack_run_loop_set_timer(&mkh_broadcast_timer, MKH_CONNECT_PHASE_MS);
+    btstack_run_loop_add_timer(&mkh_broadcast_timer);
 }
 
 static void mkh_start(void) {
@@ -222,6 +288,8 @@ static void mkh_broadcast_packet_handler(uint8_t packet_type, uint16_t channel, 
 }
 
 void mkh_broadcast_init(void) {
+    mkh_channel_mutex = xSemaphoreCreateMutex();
+
     mkh_hci_event_callback_registration.callback = &mkh_broadcast_packet_handler;
     hci_add_event_handler(&mkh_hci_event_callback_registration);
 }
