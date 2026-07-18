@@ -22,19 +22,21 @@ extern "C" {
 void mkh_broadcast_init(void);
 
 // True for device slots this firmware is actively broadcasting
-// CONNECT/CONTROL telegrams to (index = MK6 device slot 0..2). The
-// dashboard's MKH 0/1/2 rows read this directly.
+// CONNECT/CONTROL telegrams to (index = MK6 protocol device slot 0..2,
+// zero-based). The dashboard's MKH rows read this directly by the same
+// index (see mkh_ports.h for the app-facing 1-based MKH 1/2/3 numbering).
 extern bool mkh_hub_broadcasting[MKH_MK6_NUM_DEVICES];
 
-// Thread-safe setter for device 0's live channel values, read by the
-// broadcast timer when building each CONTROL telegram. port is a channel
-// index 0..5 (see mkh_ports.h for the A..F labels); value is the raw
-// telegram byte (0x00..0xFF, 0x80 = neutral), matching the wire format
-// directly. Safe to call from any task - internally serialized against
-// the broadcast timer's read via a mutex, since callers (e.g. a
-// Bluepad32 controller callback) run on a different FreeRTOS task than
-// the BTstack run loop that builds telegrams.
-void mkh_set_channel(int port, uint8_t value);
+// Thread-safe setter for a device's live channel values, read by the
+// broadcast timer when building that device's CONTROL telegram.
+// device_id is the MK6 device slot 0..2; port is a channel index 0..5
+// (see mkh_ports.h for the A..F labels); value is the raw telegram byte
+// (0x00..0xFF, 0x80 = neutral), matching the wire format directly. Safe
+// to call from any task - internally serialized against the broadcast
+// timer's read via a mutex, since callers (e.g. a Bluepad32 controller
+// callback) run on a different FreeRTOS task than the BTstack run loop
+// that builds telegrams.
+void mkh_set_channel(int device_id, int port, uint8_t value);
 
 #ifdef __cplusplus
 }

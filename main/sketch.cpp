@@ -56,11 +56,24 @@ static const uint16_t COLOR_GREEN = RGB565_GREEN;
 enum XwcState { XWC_DISCONNECTED, XWC_CONNECTING, XWC_ACTIVE };
 static XwcState xwcState = XWC_DISCONNECTED;
 
-// MKH 0/1/2 = Mould King hub broadcast state, owned by mkh_broadcast.c
-// (mkh_hub_broadcasting) - true for device slots being actively broadcast to.
+// MKH rows = Mould King hub broadcast state, owned by mkh_broadcast.c
+// (mkh_hub_broadcasting) - true for device slots being actively broadcast
+// to. Row index (ROW_MKH0/1/2) is the internal, zero-based protocol
+// device slot; the on-screen label is the hub's own 1-based numbering
+// (mkh_device_app_number(), see mkh_ports.h) - populated at runtime by
+// initMkhLabels() below since it isn't a compile-time constant.
 
 enum DashRow { ROW_XWC = 0, ROW_MKH0, ROW_MKH1, ROW_MKH2, ROW_UPTIME, ROW_COUNT };
-static const char* ROW_LABELS[ROW_COUNT] = {"XWC", "MKH 0", "MKH 1", "MKH 2", "UPTIME"};
+static char mkhLabel0[8];
+static char mkhLabel1[8];
+static char mkhLabel2[8];
+static const char* ROW_LABELS[ROW_COUNT] = {"XWC", mkhLabel0, mkhLabel1, mkhLabel2, "UPTIME"};
+
+static void initMkhLabels() {
+    snprintf(mkhLabel0, sizeof(mkhLabel0), "MKH %d", mkh_device_app_number(0));
+    snprintf(mkhLabel1, sizeof(mkhLabel1), "MKH %d", mkh_device_app_number(1));
+    snprintf(mkhLabel2, sizeof(mkhLabel2), "MKH %d", mkh_device_app_number(2));
+}
 
 static uint16_t lastXwcColorDrawn = 0xFFFF;
 static uint16_t lastHubColorDrawn[3] = {0xFFFF, 0xFFFF, 0xFFFF};
@@ -134,6 +147,8 @@ static void drawUptime(bool force) {
 }
 
 static void initDashboard() {
+    initMkhLabels();
+
     display->fillScreen(COLOR_BG);
     drawHeader();
 
@@ -197,23 +212,30 @@ static void initDisplay() {
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
 //
-// MK6 stick mapping (v0.6.0 Step 2): XWC left stick Y -> device 0 port A.
+// MK6 stick mapping: XWC left stick Y -> device 0 port A (v0.6.0 Step 2).
+// v0.7.0 Step 2 adds right stick Y -> device 1 port A, same deadzone,
+// same linear map, same sign convention (mkStickYToChannelByte is generic
+// over any axisY()/axisRY()-shaped reading, so it's reused as-is).
 //
-// Bluepad32's axisY() range is approximately -511 (full up) .. 512 (full
-// down), 0 = center - verified against Bluepad32's own docs/examples
-// (https://bluepad32.readthedocs.io/, ricardoquesada/bluepad32-arduino
-// examples/Controller/Controller.ino), not assumed: UP IS NEGATIVE. We
-// want stick-up to mean "forward" (high output byte), so the mapping
-// below inverts sign accordingly.
+// Bluepad32's axisY()/axisRY() range is approximately -511 (full up) ..
+// 512 (full down), 0 = center - verified against Bluepad32's own
+// docs/examples (https://bluepad32.readthedocs.io/,
+// ricardoquesada/bluepad32-arduino examples/Controller/Controller.ino),
+// not assumed: UP IS NEGATIVE. We want stick-up to mean "forward" (high
+// output byte), so the mapping below inverts sign accordingly.
 //
 // Deadzone is a firmware constant, not a config setting - this is the one
 // obvious place it lives.
 #define MKH_STICK_AXIS_MAGNITUDE 512
 #define MKH_STICK_DEADZONE_PERCENT 8
 
-// Maps a raw axisY() reading to a MK6 telegram byte (0x00..0xFF, 0x80 =
-// neutral). Continuous across the deadzone boundary (no output jump) and
-// hits 0xFF/0x00 exactly at Bluepad32's documented axis extremes.
+// Which MK6 device slot each XWC stick drives.
+#define MKH_XWC_LEFT_STICK_DEVICE 0
+#define MKH_XWC_RIGHT_STICK_DEVICE 1
+
+// Maps a raw axisY()/axisRY() reading to a MK6 telegram byte (0x00..0xFF,
+// 0x80 = neutral). Continuous across the deadzone boundary (no output
+// jump) and hits 0xFF/0x00 exactly at Bluepad32's documented axis extremes.
 static uint8_t mkStickYToChannelByte(int32_t axisY) {
     const int32_t deadzone = (MKH_STICK_AXIS_MAGNITUDE * MKH_STICK_DEADZONE_PERCENT) / 100;
 
@@ -278,10 +300,14 @@ void onDisconnectedController(ControllerPtr ctl) {
                 // Dashboard: XWC gone.
                 xwcState = XWC_DISCONNECTED;
 
-                // Failsafe: force every channel neutral so the hub doesn't
-                // keep coasting on the last value it heard.
-                for (int ch = 0; ch < MKH_MK6_NUM_CHANNELS; ch++) {
-                    mkh_set_channel(ch, 0x80);
+                // Failsafe: force every channel neutral on both devices
+                // the XWC drives, so neither hub keeps coasting on the
+                // last value it heard.
+                const int xwcDevices[] = {MKH_XWC_LEFT_STICK_DEVICE, MKH_XWC_RIGHT_STICK_DEVICE};
+                for (int dev : xwcDevices) {
+                    for (int ch = 0; ch < MKH_MK6_NUM_CHANNELS; ch++) {
+                        mkh_set_channel(dev, ch, 0x80);
+                    }
                 }
             }
             break;
@@ -379,9 +405,13 @@ void dumpBalanceBoard(ControllerPtr ctl) {
 
 void processGamepad(ControllerPtr ctl) {
     if (ctl->index() == 0) {
-        // XWC left stick Y -> device 0 port A (see mkStickYToChannelByte).
-        uint8_t channelByte = mkStickYToChannelByte(ctl->axisY());
-        mkh_set_channel(MKH_PORT_A, channelByte);
+        // XWC left stick Y -> device 0 port A; right stick Y -> device 1
+        // port A (see mkStickYToChannelByte).
+        uint8_t leftChannelByte = mkStickYToChannelByte(ctl->axisY());
+        mkh_set_channel(MKH_XWC_LEFT_STICK_DEVICE, MKH_PORT_A, leftChannelByte);
+
+        uint8_t rightChannelByte = mkStickYToChannelByte(ctl->axisRY());
+        mkh_set_channel(MKH_XWC_RIGHT_STICK_DEVICE, MKH_PORT_A, rightChannelByte);
     }
 
     // There are different ways to query whether a button is pressed.

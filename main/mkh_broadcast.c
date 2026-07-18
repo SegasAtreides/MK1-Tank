@@ -7,7 +7,14 @@
 // broadcast the CONNECT telegram to switch a hub into Bluetooth mode, then
 // switch to repeating a CONTROL telegram. v0.6.0 wires mkh_set_channel()
 // (see below) to the XWC left stick (see sketch.cpp) - device 0, port A,
-// live proportional control.
+// live proportional control. v0.7.0 Step 1 adds a second hub via time-
+// slicing: only one telegram can be on air at a time, so
+// mkh_broadcast_control() alternates which device's CONTROL telegram it
+// stages each ~100ms cycle (see MKH_TIME_SLICE_NUM_DEVICES below). The
+// CONNECT telegram stays a single shared broadcast - it is not device-
+// addressed (verified against BrickController2: MK6.cs's Telegram_Connect
+// is one constant shared across all three device slots), so
+// mkh_broadcast_connect() below is unchanged from v0.6.0.
 //
 // Coexistence note (verified against the vendored BTstack source,
 // components/btstack/src/hci.c): BTstack only disables advertising when
@@ -66,17 +73,19 @@
 #define MKH_COMPANY_ID_LO 0xF0
 #define MKH_COMPANY_ID_HI 0xFF
 
-// Hardcoded v0.6.0 target device slot: 0. Channel values are live, driven
-// by mkh_set_channel() from real controller input (see sketch.cpp).
-#define MKH_TEST_DEVICE_ID 0
-
 // How long to broadcast CONNECT before switching to CONTROL (a handful of
 // repeats at the ~100ms advertising interval).
 #define MKH_CONNECT_PHASE_MS 600
 
-// How often mkh_broadcast_control() re-arms itself to rebuild the CONTROL
-// telegram from live channel values - see the file header comment.
+// How often mkh_broadcast_control() re-arms itself to rebuild/stage a
+// CONTROL telegram - see the file header comment.
 #define MKH_CONTROL_REPEAT_MS 100
+
+// Number of devices actively serviced by the time-slice rotation. Step 1
+// covers devices 0 and 1 (a second physical hub); device slot 2 already
+// exists in the per-device arrays below ("leave room for 2") but isn't in
+// rotation yet - bump this to MKH_MK6_NUM_DEVICES when it joins.
+#define MKH_TIME_SLICE_NUM_DEVICES 2
 
 static btstack_packet_callback_registration_t mkh_hci_event_callback_registration;
 static bool mkh_advertising_started = false;
@@ -85,21 +94,30 @@ static btstack_timer_source_t mkh_broadcast_timer;
 // Definition for the extern declared in mkh_broadcast.h.
 bool mkh_hub_broadcasting[MKH_MK6_NUM_DEVICES] = {false};
 
-// Live per-channel raw telegram byte values for device 0 (0x80 = neutral),
+// Live per-device, per-channel raw telegram byte values (0x80 = neutral),
 // set via mkh_set_channel() and read by mkh_broadcast_control() when
-// building each CONTROL telegram. Protected by mkh_channel_mutex since the
-// setter and the broadcast timer run on different FreeRTOS tasks.
-// Explicitly initialized to 0x80 - a plain zero-init would default to
-// 0x00 (full reverse), not neutral.
-static uint8_t mkh_channel_value[MKH_MK6_NUM_CHANNELS] = {0x80, 0x80, 0x80, 0x80, 0x80, 0x80};
+// building each device's CONTROL telegram. Protected by mkh_channel_mutex
+// since the setter and the broadcast timer run on different FreeRTOS
+// tasks. Explicitly initialized to 0x80 per channel - a plain zero-init
+// would default to 0x00 (full reverse), not neutral. Sized for all
+// MKH_MK6_NUM_DEVICES device slots even though only devices 0 and 1 are
+// in the time-slice rotation right now (see MKH_TIME_SLICE_NUM_DEVICES).
+#define MKH_NEUTRAL_CHANNELS {0x80, 0x80, 0x80, 0x80, 0x80, 0x80}
+static uint8_t mkh_channel_value[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS] = {
+    MKH_NEUTRAL_CHANNELS,
+    MKH_NEUTRAL_CHANNELS,
+    MKH_NEUTRAL_CHANNELS,
+};
 static SemaphoreHandle_t mkh_channel_mutex;
 
-void mkh_set_channel(int port, uint8_t value) {
+void mkh_set_channel(int device_id, int port, uint8_t value) {
+    if (device_id < 0 || device_id >= MKH_MK6_NUM_DEVICES)
+        return;
     if (port < 0 || port >= MKH_MK6_NUM_CHANNELS)
         return;
 
     xSemaphoreTake(mkh_channel_mutex, portMAX_DELAY);
-    mkh_channel_value[port] = value;
+    mkh_channel_value[device_id][port] = value;
     xSemaphoreGive(mkh_channel_mutex);
 }
 
@@ -138,21 +156,35 @@ static void mkh_set_adv_payload(const uint8_t* payload, size_t payload_len) {
     gap_advertisements_set_data((uint8_t)i, mkh_adv_buf);
 }
 
-// Last-logged snapshot, so the (verbose) per-telegram log only prints when
-// a channel value actually changes, not on every ~100ms refresh cycle.
-static uint8_t mkh_last_logged_values[MKH_MK6_NUM_CHANNELS];
-static bool mkh_control_logged_once = false;
+// Last-logged snapshot per device, so the (verbose) per-telegram log only
+// prints when that device's channel values actually change, not on every
+// ~100ms cycle it's serviced.
+static uint8_t mkh_last_logged_values[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS];
+static bool mkh_control_logged_once[MKH_MK6_NUM_DEVICES] = {false};
+
+// Which device's CONTROL telegram gets staged next. Only one telegram can
+// be on air at a time (unaddressed hubs simply coast until a telegram
+// with their address arrives), so this rotates through the devices in
+// MKH_TIME_SLICE_NUM_DEVICES each time this function runs - i.e. each
+// specific device's own telegram effectively refreshes every
+// (MKH_TIME_SLICE_NUM_DEVICES * MKH_CONTROL_REPEAT_MS)ms, not every
+// MKH_CONTROL_REPEAT_MS.
+static int mkh_time_slice_next_device = 0;
 
 static void mkh_broadcast_control(btstack_timer_source_t* ts) {
+    int device_id = mkh_time_slice_next_device;
+    mkh_time_slice_next_device = (mkh_time_slice_next_device + 1) % MKH_TIME_SLICE_NUM_DEVICES;
+
     uint8_t values[MKH_MK6_NUM_CHANNELS];
     xSemaphoreTake(mkh_channel_mutex, portMAX_DELAY);
-    memcpy(values, mkh_channel_value, sizeof(values));
+    memcpy(values, mkh_channel_value[device_id], sizeof(values));
     xSemaphoreGive(mkh_channel_mutex);
 
     uint8_t telegram[MKH_TELEGRAM_CONTROL_LEN];
-    mkh_protocol_control_telegram_neutral(MKH_TEST_DEVICE_ID, telegram);
+    mkh_protocol_control_telegram_neutral(device_id, telegram);
 
-    bool changed = !mkh_control_logged_once || memcmp(values, mkh_last_logged_values, sizeof(values)) != 0;
+    bool changed =
+        !mkh_control_logged_once[device_id] || memcmp(values, mkh_last_logged_values[device_id], sizeof(values)) != 0;
 
     char ports_log[MKH_MK6_NUM_CHANNELS * 8 + 1];
     size_t pos = 0;
@@ -174,20 +206,28 @@ static void mkh_broadcast_control(btstack_timer_source_t* ts) {
     size_t payload_len = mkh_protocol_encrypt(telegram, sizeof(telegram), payload, sizeof(payload));
     mkh_set_adv_payload(payload, payload_len);
 
+    // Dashboard: this device is now (and henceforth) serviced by the
+    // time-slicer. Nothing currently drops a device back out of rotation
+    // (no stop/idle trigger exists yet), so there is no corresponding
+    // "set false" path yet.
+    mkh_hub_broadcasting[device_id] = true;
+
     if (changed) {
         mkh_log_hex("CONTROL raw telegram", telegram, sizeof(telegram));
         mkh_log_hex("CONTROL encrypted payload", payload, payload_len);
-        logi("MK6 Broadcast: CONTROL telegram updated (device=%d), ports: %s\n", MKH_TEST_DEVICE_ID, ports_log);
-        memcpy(mkh_last_logged_values, values, sizeof(values));
-        mkh_control_logged_once = true;
+        logi("MK6 Broadcast: CONTROL telegram updated (device=%d), ports: %s\n", device_id, ports_log);
+        memcpy(mkh_last_logged_values[device_id], values, sizeof(values));
+        mkh_control_logged_once[device_id] = true;
     }
 
-    // Re-arm: rebuild from live channel values every ~100ms so stick
-    // movement is reflected promptly. gap_advertisements_set_data() only
-    // stages new advertising *data* (not parameters), which BTstack sends
-    // without stopping/restarting advertising - confirmed against
-    // components/btstack/src/hci.c: the stop-before-reconfigure path is
-    // gated on LE_ADVERTISEMENT_TASKS_SET_PARAMS, not SET_ADV_DATA.
+    // Re-arm: rebuild/stage the next device's telegram every ~100ms.
+    // gap_advertisements_set_data() only stages new advertising *data*
+    // (not parameters), which BTstack sends without stopping/restarting
+    // advertising - confirmed against components/btstack/src/hci.c: the
+    // stop-before-reconfigure path is gated on
+    // LE_ADVERTISEMENT_TASKS_SET_PARAMS, not SET_ADV_DATA. Safe to call
+    // every cycle even though which device it targets now changes cycle
+    // to cycle.
     btstack_run_loop_set_timer(ts, MKH_CONTROL_REPEAT_MS);
     btstack_run_loop_add_timer(ts);
 }
@@ -204,12 +244,9 @@ static void mkh_broadcast_connect(void) {
     mkh_set_adv_payload(payload, payload_len);
     gap_advertisements_enable(1);
 
-    // Dashboard: device MKH_TEST_DEVICE_ID is now actively being broadcast
-    // to. Nothing currently stops broadcasting once started (no stop/idle
-    // trigger exists yet - that arrives with real controller-driven
-    // control), so there is no corresponding "set false" path yet.
-    mkh_hub_broadcasting[MKH_TEST_DEVICE_ID] = true;
-
+    // mkh_hub_broadcasting[] is set per-device once the time-slicer
+    // actually starts staging that device's CONTROL telegram - see
+    // mkh_broadcast_control().
     logi("MK6 Broadcast: advertising STARTED, broadcasting CONNECT telegram for %dms before switching to CONTROL\n",
          MKH_CONNECT_PHASE_MS);
 
