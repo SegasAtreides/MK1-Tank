@@ -32,6 +32,21 @@ static Arduino_DataBus* displayBus =
 // Native panel is 240x320 (portrait); rotation=1 renders it as 320x240 (landscape).
 static Arduino_GFX* display = new Arduino_ST7789(displayBus, TFT_RST, 1, true, 240, 320);
 
+// WO11: single compile-time firmware version string, used on both the
+// boot splash and the stats page (per the order - the dashboard's own
+// DASH_TITLE below is a separate, pre-existing string, out of WO11's
+// scope to touch).
+#define MK1_FW_VERSION "v0.11.0"
+
+// WO11: telegram service rate label for the stats page. Mirrors
+// mkh_broadcast.c's MKH_CONTROL_REPEAT_MS (100ms slice re-arm) and
+// MKH_TIME_SLICE_NUM_DEVICES (2 active devices) - restated here rather
+// than derived, since those are private constants inside a file WO11
+// requires zero changes to (broadcast/slicer). This is the *configured*
+// rate (100ms * 2 devices = 200ms/hub), not a live measurement - keep
+// this string in sync by hand if either constant changes.
+static const char* MK1_TELEGRAM_RATE_LABEL = "100ms slice / 200ms per hub";
+
 //
 // Dashboard (Stage 2)
 //
@@ -88,10 +103,22 @@ static uint32_t lastUptimeDrawnSec = 0xFFFFFFFF;
 // service timer is independent, and BP32.update()/processControllers()
 // below run unconditionally every loop() iteration regardless of page),
 // so page state is structurally invisible to them, not just
-// by-convention invisible. Boots on PAGE_DASHBOARD, matching v0.9.0
-// behavior exactly until a page switch is requested.
-enum UiPage { PAGE_DASHBOARD = 0, PAGE_EDIT_SELECT, PAGE_EDIT_CAPTURE, PAGE_EDIT_SETTINGS, PAGE_COUNT };
-static UiPage currentPage = PAGE_DASHBOARD;
+// by-convention invisible.
+//
+// WO11: added PAGE_SPLASH/PAGE_STATS ahead of PAGE_DASHBOARD in the
+// enum, and boot now starts on PAGE_SPLASH instead of landing directly
+// on PAGE_DASHBOARD - see setup() below. There is no path back to
+// PAGE_SPLASH/PAGE_STATS once left (not in WO11 scope).
+enum UiPage {
+    PAGE_SPLASH = 0,
+    PAGE_STATS,
+    PAGE_DASHBOARD,
+    PAGE_EDIT_SELECT,
+    PAGE_EDIT_CAPTURE,
+    PAGE_EDIT_SETTINGS,
+    PAGE_COUNT
+};
+static UiPage currentPage = PAGE_SPLASH;
 
 static int16_t rowTop(int idx) {
     return ROW_START_Y + idx * (ROW_H + ROW_GAP);
@@ -99,6 +126,26 @@ static int16_t rowTop(int idx) {
 
 static int16_t textWidth(const char* s, uint8_t size) {
     return (int16_t)strlen(s) * 6 * size;
+}
+
+// v0.8.0 Step 1: config-source indicator, three-way (v0.9.0 Step 1
+// honesty tweak). CFG:DEF = fell back to compiled-in defaults (no file
+// / open failed). CFG:FS = file parsed with zero skipped lines. CFG:FS!
+// = file parsed but >=1 line was rejected as malformed (see
+// mkh_config_get_skipped_line_count() and the per-line "skipped"
+// warnings in the boot log for which).
+//
+// WO11: factored out of drawHeader() so the stats page's CONFIG line
+// can show the exact same value the dashboard's CFG field shows,
+// guaranteed - not a second, potentially-drifting copy of this logic.
+static const char* mkhCfgLabel() {
+    if (!mkh_config_source_is_file()) {
+        return "CFG:DEF";
+    } else if (mkh_config_get_skipped_line_count() > 0) {
+        return "CFG:FS!";
+    } else {
+        return "CFG:FS";
+    }
 }
 
 static void drawHeader() {
@@ -109,25 +156,9 @@ static void drawHeader() {
     display->setCursor(x, (HEADER_H - 16) / 2);
     display->print(DASH_TITLE);
 
-    // v0.8.0 Step 1: config-source indicator. Minimal footprint - reuses
-    // spare header space at size 1 rather than adding a dashboard row.
     // Config is read once at boot (no hot-reload), so this is drawn once
     // here and never needs to be refreshed like the status dots.
-    //
-    // v0.9.0 Step 1: CFG-honesty tweak - a third, degraded state.
-    // CFG:DEF = fell back to compiled-in defaults (no file / open
-    // failed). CFG:FS = file parsed with zero skipped lines. CFG:FS! =
-    // file parsed but >=1 line was rejected as malformed (see
-    // mkh_config_get_skipped_line_count() and the per-line "skipped"
-    // warnings in the boot log for which).
-    const char* cfgLabel;
-    if (!mkh_config_source_is_file()) {
-        cfgLabel = "CFG:DEF";
-    } else if (mkh_config_get_skipped_line_count() > 0) {
-        cfgLabel = "CFG:FS!";
-    } else {
-        cfgLabel = "CFG:FS";
-    }
+    const char* cfgLabel = mkhCfgLabel();
     Console.printf("MK1 Dashboard: CFG field = %s (skipped_lines=%d)\n", cfgLabel,
                     mkh_config_get_skipped_line_count());
     display->setTextSize(1);
@@ -266,17 +297,24 @@ static uint16_t xwcColor() {
     }
 }
 
+// WO11: factored out so the stats page's UPTIME line can reuse the
+// exact same HH:MM:SS formatting as the dashboard's uptime row.
+static void formatUptime(char* buf, size_t bufSize) {
+    uint32_t totalSec = millis() / 1000;
+    uint32_t h = totalSec / 3600;
+    uint32_t m = (totalSec % 3600) / 60;
+    uint32_t s = totalSec % 60;
+    snprintf(buf, bufSize, "%02u:%02u:%02u", (unsigned)h, (unsigned)m, (unsigned)s);
+}
+
 static void drawUptime(bool force) {
     uint32_t totalSec = millis() / 1000;
     if (!force && totalSec == lastUptimeDrawnSec)
         return;
     lastUptimeDrawnSec = totalSec;
 
-    uint32_t h = totalSec / 3600;
-    uint32_t m = (totalSec % 3600) / 60;
-    uint32_t s = totalSec % 60;
     char buf[9];
-    snprintf(buf, sizeof(buf), "%02u:%02u:%02u", (unsigned)h, (unsigned)m, (unsigned)s);
+    formatUptime(buf, sizeof(buf));
 
     int16_t y = rowTop(ROW_UPTIME);
     int16_t valW = textWidth("00:00:00", 2);
@@ -373,6 +411,126 @@ static void drawEditorPlaceholder(const char* pageName, UiPage page) {
     }
 }
 
+// WO11: boot splash. Static, primitive-only side-profile tank
+// silhouette (hull, turret, barrel, tracks+wheels) - no bitmap assets,
+// no animation, no delay call anywhere in this function. Boot-time
+// neutrality holds by construction: setup() (below) calls this once and
+// proceeds immediately to the rest of boot work - this function's own
+// runtime is the only cost, and it's a handful of primitive draws, not
+// a new phase of boot.
+static const uint16_t COLOR_TANK = RGB565(90, 110, 70);
+static const uint16_t COLOR_WHEEL = COLOR_CARD_BORDER;
+
+static void drawSplash() {
+    display->fillScreen(COLOR_BG);
+
+    const char* title = "MK1";
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(4);
+    display->setCursor((SCR_W - textWidth(title, 4)) / 2, 36);
+    display->print(title);
+
+    // Side-profile silhouette, centered around x=160. All primitives.
+    const int16_t hullX = 110, hullY = 150, hullW = 100, hullH = 30;
+    const int16_t turretX = 140, turretY = 122, turretW = 45, turretH = 28;
+    const int16_t barrelX = turretX + turretW, barrelY = turretY + turretH / 2 - 3, barrelW = 45, barrelH = 6;
+    const int16_t trackX = 95, trackY = hullY + hullH, trackW = 130, trackH = 16;
+
+    display->fillRoundRect(hullX, hullY, hullW, hullH, 4, COLOR_TANK);
+    display->fillRoundRect(turretX, turretY, turretW, turretH, 4, COLOR_TANK);
+    display->fillRect(barrelX, barrelY, barrelW, barrelH, COLOR_TANK);
+    display->fillRoundRect(trackX, trackY, trackW, trackH, 4, COLOR_TANK);
+    for (int i = 0; i < 5; i++) {
+        int16_t wx = trackX + 14 + i * ((trackW - 28) / 4);
+        display->fillCircle(wx, trackY + trackH / 2, 6, COLOR_WHEEL);
+    }
+
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(1);
+    int16_t vx = (SCR_W - textWidth(MK1_FW_VERSION, 1)) / 2;
+    display->setCursor(vx, trackY + trackH + 16);
+    display->print(MK1_FW_VERSION);
+}
+
+// WO11: stats page. One line per item, values sampled at render time
+// (see updateStatsUptime() below for the one exception - a cheap,
+// once-per-second UPTIME-line-only refresh, piggybacked on loop()'s
+// existing cadence, no new timer machinery). Holds until tapped -
+// dispatch lives in loop(), not here.
+enum StatsLine { STATS_LINE_FW = 0, STATS_LINE_UPTIME, STATS_LINE_CONFIG, STATS_LINE_RATE, STATS_LINE_XWC };
+static const int16_t STATS_LINE_X = 20;
+static const int16_t STATS_LINE_Y0 = 56;
+static const int16_t STATS_LINE_GAP = 18;
+static uint32_t lastStatsUptimeSec = 0xFFFFFFFF;
+
+static int16_t statsLineY(int idx) {
+    return STATS_LINE_Y0 + idx * STATS_LINE_GAP;
+}
+
+static void drawStatsLine(int idx, const char* text) {
+    int16_t y = statsLineY(idx);
+    display->fillRect(STATS_LINE_X, y, SCR_W - 2 * STATS_LINE_X, 8, COLOR_BG);
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(1);
+    display->setCursor(STATS_LINE_X, y);
+    display->print(text);
+}
+
+static void drawStatsPage() {
+    display->fillScreen(COLOR_BG);
+
+    const char* title = "MK1 STATS";
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(2);
+    display->setCursor((SCR_W - textWidth(title, 2)) / 2, 14);
+    display->print(title);
+
+    char line[48];
+
+    snprintf(line, sizeof(line), "FW: %s", MK1_FW_VERSION);
+    drawStatsLine(STATS_LINE_FW, line);
+
+    char uptimeBuf[9];
+    formatUptime(uptimeBuf, sizeof(uptimeBuf));
+    snprintf(line, sizeof(line), "UPTIME: %s", uptimeBuf);
+    drawStatsLine(STATS_LINE_UPTIME, line);
+    lastStatsUptimeSec = millis() / 1000;
+
+    snprintf(line, sizeof(line), "CONFIG: %s", mkhCfgLabel());
+    drawStatsLine(STATS_LINE_CONFIG, line);
+
+    snprintf(line, sizeof(line), "RATE: %s", MK1_TELEGRAM_RATE_LABEL);
+    drawStatsLine(STATS_LINE_RATE, line);
+
+    snprintf(line, sizeof(line), "XWC: %s", xwcState == XWC_ACTIVE ? "CONNECTED" : "NOT CONNECTED");
+    drawStatsLine(STATS_LINE_XWC, line);
+
+    const char* hint = "TAP ANYWHERE TO CONTINUE";
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(1);
+    display->setCursor((SCR_W - textWidth(hint, 1)) / 2, 210);
+    display->print(hint);
+}
+
+// Called from loop() only while currentPage == PAGE_STATS (see below).
+// Cheap once-per-second diff-and-redraw of the UPTIME line only, same
+// pattern as the dashboard's drawUptime(force=false) - not required by
+// WO11 (static/sampled-at-render is acceptable), included because it's
+// effectively free within the existing loop cadence and makes "uptime
+// counting from boot" bench-observable while the page is held on screen.
+static void updateStatsUptime() {
+    uint32_t totalSec = millis() / 1000;
+    if (totalSec == lastStatsUptimeSec)
+        return;
+    lastStatsUptimeSec = totalSec;
+
+    char uptimeBuf[9];
+    formatUptime(uptimeBuf, sizeof(uptimeBuf));
+    char line[48];
+    snprintf(line, sizeof(line), "UPTIME: %s", uptimeBuf);
+    drawStatsLine(STATS_LINE_UPTIME, line);
+}
+
 // Sole navigation entry point (WO10 Step 0 design intent): every future
 // page type just needs an enum value, a render branch here, and a
 // dispatch branch in loop() - no other call site changes. Renders the
@@ -381,6 +539,12 @@ static void drawEditorPlaceholder(const char* pageName, UiPage page) {
 static void goToPage(UiPage page) {
     currentPage = page;
     switch (page) {
+        case PAGE_SPLASH:
+            drawSplash();
+            break;
+        case PAGE_STATS:
+            drawStatsPage();
+            break;
         case PAGE_DASHBOARD:
             initDashboard();
             break;
@@ -444,12 +608,15 @@ static void dispatchEditorTouch(int16_t touchX, int16_t touchY) {
     }
 }
 
+// WO11: no longer draws any page content itself (previously called
+// initDashboard() directly) - setup() below now owns which page is
+// drawn first via goToPage(), since boot must land on PAGE_SPLASH, not
+// PAGE_DASHBOARD. This function is display hardware bring-up only.
 static void initDisplay() {
     pinMode(TFT_BL, OUTPUT);
     digitalWrite(TFT_BL, HIGH);
 
     display->begin();
-    initDashboard();
 }
 
 //
@@ -867,6 +1034,18 @@ void setup() {
 
     initDisplay();
 
+    // WO11: splash goes up the moment the display is ready, then boot
+    // work continues exactly as before with no delay/animation inserted
+    // - the "zero added boot time" constraint holds because nothing
+    // here waits on anything; goToPage(PAGE_SPLASH) just draws and
+    // returns. The splash is visible for however long the rest of
+    // setup() naturally takes, whatever that is - see the matching
+    // goToPage(PAGE_STATS) call at the end of this function, and the
+    // two millis()-stamped log lines bracketing that duration for the
+    // bench comparison against v0.10.0's boot timing.
+    goToPage(PAGE_SPLASH);
+    Console.printf("MK1 Boot: splash shown at %lu ms\n", (unsigned long)millis());
+
     Console.printf("Firmware: %s\n", BP32.firmwareVersion());
     const uint8_t* addr = BP32.localBdAddress();
     Console.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
@@ -899,6 +1078,12 @@ void setup() {
     // This service allows clients, like a mobile app, to setup and see the state of Bluepad32.
     // By default, it is disabled.
     BP32.enableBLEService(false);
+
+    // WO11: boot work is complete - switch from splash to stats
+    // immediately (no minimum display time; if boot was fast, the
+    // splash just wasn't up for long, which is correct per the order).
+    Console.printf("MK1 Boot: boot work complete, entering stats at %lu ms\n", (unsigned long)millis());
+    goToPage(PAGE_STATS);
 }
 
 // v0.9.0 Step 1, Amendment A: MKH row touch hit zones. Calibration
@@ -951,6 +1136,9 @@ void loop() {
     // apply ONLY in PAGE_DASHBOARD; editor pages use dispatchEditorTouch()
     // instead. The ISR-driven consumption side (mkh_touch_poll() itself)
     // is untouched - only this branch on currentPage is new.
+    //
+    // WO11: two more currentPage branches - PAGE_STATS (tap anywhere ->
+    // dashboard) and PAGE_SPLASH (no interaction, boot-driven only).
     int16_t touchX, touchY;
     if (mkh_touch_poll(&touchX, &touchY)) {
         if (currentPage == PAGE_DASHBOARD) {
@@ -1017,6 +1205,15 @@ void loop() {
                     }
                 }
             }
+        } else if (currentPage == PAGE_STATS) {
+            // WO11: any tap anywhere on the stats page proceeds to the
+            // dashboard - no sub-regions, no other action.
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> stats page, proceeding to dashboard\n", touchX,
+                            touchY);
+            goToPage(PAGE_DASHBOARD);
+        } else if (currentPage == PAGE_SPLASH) {
+            // WO11: splash is boot-driven only (see setup()) - no tap
+            // interaction, intentionally ignored.
         } else {
             dispatchEditorTouch(touchX, touchY);
         }
@@ -1024,6 +1221,8 @@ void loop() {
 
     if (currentPage == PAGE_DASHBOARD) {
         updateDashboard();
+    } else if (currentPage == PAGE_STATS) {
+        updateStatsUptime();
     }
 
     // The main loop must have some kind of "yield to lower priority task" event.
