@@ -157,6 +157,64 @@ struct EditContext {
 };
 static EditContext editCtx = {-1, -1, false, MKH_INPUT_NONE, false};
 
+// WO10-FINAL: pending session - accumulates committed per-port edits
+// ACROSS ports (order requirement), independent of editCtx's single-
+// port focus. A port becomes dirty=true the moment settings is reached
+// for it (capturing the input is an implicit keep, same precedent as
+// Step 2's "NEXT never prompts") - see goToPage()'s PAGE_EDIT_SETTINGS
+// case. Never touched by mkh_config_get()/the live table directly;
+// only pushPendingSessionToLiveTable() (Test-ON, Save) writes it out.
+struct PendingPortEdit {
+    bool dirty;
+    mkh_input_source_t input;
+    bool invert;
+    uint8_t max_percent;
+    mkh_input_mode_t mode;
+};
+static PendingPortEdit pendingEdits[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS];
+
+// WO10-FINAL: Test toggle, visible on every editor page (hub/port/
+// capture/settings - not the dashboard, which has its own unrelated
+// broadcast toggles). ON pushes the current pending session to the live
+// mapping table once (a one-shot forward push on the OFF->ON edge, not
+// a continuous sync - see handleTestToggleTap() below); OFF is inert,
+// per the order ("toggling OFF concludes the test, values stay live").
+static bool testActive = false;
+
+static bool sessionHasPendingEdits() {
+    for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++)
+        for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++)
+            if (pendingEdits[d][p].dirty)
+                return true;
+    return false;
+}
+
+static void clearPendingSession() {
+    for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++)
+        for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++)
+            pendingEdits[d][p].dirty = false;
+}
+
+// Writes every dirty pending edit into the live mkh_config table - the
+// one place Test-ON and Save actually touch the live table (through
+// mkh_config_set_port(), never the protocol/broadcast layer directly).
+static void pushPendingSessionToLiveTable() {
+    for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++) {
+        for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++) {
+            if (pendingEdits[d][p].dirty) {
+                mkh_config_set_port(d, p, pendingEdits[d][p].input, pendingEdits[d][p].invert,
+                                     pendingEdits[d][p].max_percent, pendingEdits[d][p].mode);
+            }
+        }
+    }
+}
+
+// WO10 Step 1/2 behavior, UNCHANGED by WO10-FINAL: clears only the
+// current single-port SELECTION (device/port/capture) - still exactly
+// what port-select's Back uses (see dispatchPortSelectTouch() below).
+// Deliberately does NOT touch the pending session below - "accumulate
+// across ports" requires that navigating hub<->port to focus a
+// DIFFERENT port must not discard edits already committed for others.
 static void clearEditContext() {
     editCtx.selected_device = -1;
     editCtx.selected_port = -1;
@@ -165,10 +223,36 @@ static void clearEditContext() {
     editCtx.capture_valid = false;
 }
 
-// Forward-declared so the hub/port select dispatch functions (defined
-// before goToPage() itself, further down) can call it - goToPage()'s
-// own definition and doc comment are unchanged, just declared early.
+// WO10-FINAL: clears the WHOLE editing session - selection AND the
+// accumulated pending edits AND Test state. Used only where the order
+// actually calls for the session to end: a fresh entry from the
+// dashboard, the exit-editor prompt's DISCARD, and Reset ("restores
+// saved config to the table and clears the session").
+static void clearEditorSession() {
+    clearEditContext();
+    clearPendingSession();
+    testActive = false;
+}
+
+// Forward-declared so performSaveAndExit() right below, and the hub/
+// port select dispatch functions further down, can call it before
+// goToPage() itself is actually defined - goToPage()'s own definition
+// and doc comment are unchanged, just declared early.
 static void goToPage(UiPage page);
+
+// WO10-FINAL: shared by settings' Save button and the exit-editor
+// prompt's SAVE option. The caller is responsible for committing any of
+// ITS OWN in-page scratch into pendingEdits[][] first (this only pushes
+// what's already committed there) - keeps this one function generic
+// across both callers instead of two near-duplicates.
+static bool performSaveAndExit() {
+    pushPendingSessionToLiveTable();
+    bool ok = mkh_storage_save_config();
+    Console.printf("MK1 Editor: save %s\n", ok ? "succeeded" : "FAILED");
+    clearEditorSession();
+    goToPage(PAGE_DASHBOARD);
+    return ok;
+}
 
 static int16_t rowTop(int idx) {
     return ROW_START_Y + idx * (ROW_H + ROW_GAP);
@@ -221,14 +305,31 @@ static void drawHeader() {
 // out of the WO9 Amendment A full-screen MKH split (see
 // MKH_ZONE_1_2_BOUNDARY_Y below) rather than shrinking or moving any
 // MKH row boundary - loop() checks this rect FIRST, before falling
-// through to the unchanged touchYToDeviceId() split, so every pixel
-// outside this 30x24 header corner resolves exactly as it did in
-// v0.9.0. Placed left of the (centered) title, clear of both the title
-// text and the right-aligned CFG label.
+// through to the unchanged touchYToDeviceId() split. Placed left of the
+// (centered) title, clear of both the title text and the right-aligned
+// CFG label.
 static const int16_t SETTINGS_BTN_X = 2;
 static const int16_t SETTINGS_BTN_Y = 2;
 static const int16_t SETTINGS_BTN_W = 30;
-static const int16_t SETTINGS_BTN_H = HEADER_H - 4;  // 24
+static const int16_t SETTINGS_BTN_H = HEADER_H - 4;  // 24 - visual size, UNCHANGED
+
+// WO10 CLOSEOUT: PM-reported defect - the 30x24 visual rect was also
+// the hit zone, and taps near the corner were landing just outside it,
+// falling through to "nearest MKH row" (MKH1) instead. Fix: a SEPARATE,
+// larger hit zone (order: "hit zone may exceed the visual") - the drawn
+// button stays exactly as it was (SETTINGS_BTN_X/Y/W/H, above,
+// untouched), only the invisible tappable area grows. No collision with
+// the title or CFG label to solve for, because nothing visual moved -
+// investigated "uptime" per the order's suggestion, but uptime lives on
+// a dashboard ROW (ROW_UPTIME), not the header at all; the header only
+// ever held the title + CFG label + this button, and neither needed to
+// change for a hit-zone-only fix. Deliberately anchored at (0,0) rather
+// than mirroring SETTINGS_BTN_X/Y - a hit zone is free to start right at
+// the panel edge even though the visual button doesn't.
+static const int16_t SETTINGS_HIT_X = 0;
+static const int16_t SETTINGS_HIT_Y = 0;
+static const int16_t SETTINGS_HIT_W = 54;  // >= the ordered 48px minimum
+static const int16_t SETTINGS_HIT_H = 40;  // >= the ordered 36px minimum
 
 static void drawSettingsButton() {
     display->fillRoundRect(SETTINGS_BTN_X, SETTINGS_BTN_Y, SETTINGS_BTN_W, SETTINGS_BTN_H, 4, COLOR_CARD_BG);
@@ -238,6 +339,49 @@ static void drawSettingsButton() {
     int16_t tx = SETTINGS_BTN_X + (SETTINGS_BTN_W - textWidth("SET", 1)) / 2;
     display->setCursor(tx, SETTINGS_BTN_Y + (SETTINGS_BTN_H - 8) / 2);
     display->print("SET");
+}
+
+// WO10-FINAL: Test toggle, visible on every editor page (hub/port/
+// capture/settings). Same small-corner-widget class as the settings
+// button above (30x24, not this order's 40px/20px-margin rule for
+// PRIMARY interactive targets - this is an auxiliary control, same
+// precedent as SET) - top-right corner, mirroring SET's top-left.
+static const int16_t TEST_TOGGLE_X = SCR_W - 32;  // 288
+static const int16_t TEST_TOGGLE_Y = 2;
+static const int16_t TEST_TOGGLE_W = 30;
+static const int16_t TEST_TOGGLE_H = HEADER_H - 4;  // 24
+
+static void drawTestToggle() {
+    uint16_t borderColor = testActive ? COLOR_GREEN : COLOR_CARD_BORDER;
+    display->fillRoundRect(TEST_TOGGLE_X, TEST_TOGGLE_Y, TEST_TOGGLE_W, TEST_TOGGLE_H, 4, COLOR_CARD_BG);
+    display->drawRoundRect(TEST_TOGGLE_X, TEST_TOGGLE_Y, TEST_TOGGLE_W, TEST_TOGGLE_H, 4, borderColor);
+    display->setTextColor(testActive ? COLOR_GREEN : COLOR_LABEL);
+    display->setTextSize(1);
+    const char* label = "TEST";
+    int16_t tx = TEST_TOGGLE_X + (TEST_TOGGLE_W - textWidth(label, 1)) / 2;
+    display->setCursor(tx, TEST_TOGGLE_Y + (TEST_TOGGLE_H - 8) / 2);
+    display->print(label);
+}
+
+static bool testToggleHit(int16_t touchX, int16_t touchY) {
+    return touchX >= TEST_TOGGLE_X && touchX < TEST_TOGGLE_X + TEST_TOGGLE_W && touchY >= TEST_TOGGLE_Y &&
+           touchY < TEST_TOGGLE_Y + TEST_TOGGLE_H;
+}
+
+// ON pushes the pending session once (a one-shot forward push, not a
+// continuous sync - see the order's "forward-push only"). OFF is
+// inert - "toggling OFF concludes the test, values stay live" means
+// exactly that: nothing is reverted.
+static void handleTestToggleTap() {
+    testActive = !testActive;
+    if (testActive) {
+        Console.printf("MK1 Editor: TEST ON - pushing pending session (%s) to live table\n",
+                        sessionHasPendingEdits() ? "non-empty" : "empty");
+        pushPendingSessionToLiveTable();
+    } else {
+        Console.printf("MK1 Editor: TEST OFF - concluded, live values unchanged\n");
+    }
+    drawTestToggle();
 }
 
 static void drawCardShell(int idx) {
@@ -613,6 +757,16 @@ static const int16_t SELECT_BACK_W = 140;
 static const int16_t SELECT_BACK_Y = 180;
 static const int16_t SELECT_BACK_H = 40;  // bottom=220, 20px from screen edge (240)
 
+// WO10-FINAL: exit-editor prompt (hub select's Back, when the pending
+// session has anything dirty) - SAVE/DISCARD, same row SELECT_BACK_*
+// occupies, same geometry rules (40px short dim, 20px margins: left
+// button left edge 20, right button right edge 300 = 20px from 320).
+static const int16_t EXIT_PROMPT_LEFT_X = 20;
+static const int16_t EXIT_PROMPT_LEFT_W = 120;
+static const int16_t EXIT_PROMPT_RIGHT_X = 180;
+static const int16_t EXIT_PROMPT_RIGHT_W = 120;
+static bool exitPromptActive = false;
+
 // Mirrors mkh_broadcast.c's MKH_TIME_SLICE_NUM_DEVICES (2) - the third
 // hub (device 2 / MKH3) is structurally parked project-wide (see
 // mkh_broadcast_toggle_on()'s own device_id >= MKH_TIME_SLICE_NUM_
@@ -669,7 +823,22 @@ static void drawHubSelect() {
         drawHubButton(i);
     }
 
+    exitPromptActive = false;
     drawButtonAt(SELECT_BACK_X, SELECT_BACK_Y, SELECT_BACK_W, SELECT_BACK_H, "< BACK");
+    drawTestToggle();
+}
+
+static void drawExitPromptOverlay() {
+    const char* q = "SAVE CHANGES?";
+    display->fillRect(0, 140, SCR_W, 30, COLOR_BG);
+    display->setTextColor(COLOR_YELLOW);
+    display->setTextSize(2);
+    display->setCursor((SCR_W - textWidth(q, 2)) / 2, 146);
+    display->print(q);
+
+    display->fillRect(0, SELECT_BACK_Y - 4, SCR_W, SELECT_BACK_H + 8, COLOR_BG);
+    drawButtonAt(EXIT_PROMPT_LEFT_X, SELECT_BACK_Y, EXIT_PROMPT_LEFT_W, SELECT_BACK_H, "SAVE");
+    drawButtonAt(EXIT_PROMPT_RIGHT_X, SELECT_BACK_Y, EXIT_PROMPT_RIGHT_W, SELECT_BACK_H, "DISCARD");
 }
 
 // Hub select's own hit zones - separate from dispatchEditorTouch()
@@ -677,12 +846,46 @@ static void drawHubSelect() {
 // touchYToDeviceId() split (different page, different geometry
 // entirely - this is not a reuse of that logic).
 static void dispatchHubSelectTouch(int16_t touchX, int16_t touchY) {
+    if (exitPromptActive) {
+        bool inSave = touchX >= EXIT_PROMPT_LEFT_X && touchX < EXIT_PROMPT_LEFT_X + EXIT_PROMPT_LEFT_W &&
+                      touchY >= SELECT_BACK_Y && touchY < SELECT_BACK_Y + SELECT_BACK_H;
+        bool inDiscard = touchX >= EXIT_PROMPT_RIGHT_X && touchX < EXIT_PROMPT_RIGHT_X + EXIT_PROMPT_RIGHT_W &&
+                         touchY >= SELECT_BACK_Y && touchY < SELECT_BACK_Y + SELECT_BACK_H;
+        if (inSave) {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> exit-editor prompt SAVE\n", touchX, touchY);
+            exitPromptActive = false;
+            performSaveAndExit();
+        } else if (inDiscard) {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> exit-editor prompt DISCARD\n", touchX, touchY);
+            exitPromptActive = false;
+            clearEditorSession();
+            goToPage(PAGE_DASHBOARD);
+        }
+        return;
+    }
+
+    if (testToggleHit(touchX, touchY)) {
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> Test toggle (hub select)\n", touchX, touchY);
+        handleTestToggleTap();
+        return;
+    }
+
     bool inBack = touchX >= SELECT_BACK_X && touchX < SELECT_BACK_X + SELECT_BACK_W && touchY >= SELECT_BACK_Y &&
                   touchY < SELECT_BACK_Y + SELECT_BACK_H;
     if (inBack) {
-        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> hub select BACK -> dashboard\n", touchX, touchY);
-        clearEditContext();
-        goToPage(PAGE_DASHBOARD);
+        if (sessionHasPendingEdits()) {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> hub select BACK, prompting (pending session)\n",
+                            touchX, touchY);
+            exitPromptActive = true;
+            drawExitPromptOverlay();
+        } else {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> hub select BACK -> dashboard\n", touchX, touchY);
+            // No pending edits, but leaving the editor entirely either
+            // way - full session end, not just a selection clear
+            // (matters if e.g. Test was toggled ON with nothing edited).
+            clearEditorSession();
+            goToPage(PAGE_DASHBOARD);
+        }
         return;
     }
 
@@ -772,19 +975,29 @@ static void drawPortSelect() {
     }
 
     drawButtonAt(SELECT_BACK_X, SELECT_BACK_Y, SELECT_BACK_W, SELECT_BACK_H, "< BACK");
+    drawTestToggle();
 }
 
 // Port select's own hit zones - same separation rationale as
 // dispatchHubSelectTouch() above.
 static void dispatchPortSelectTouch(int16_t touchX, int16_t touchY) {
+    if (testToggleHit(touchX, touchY)) {
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> Test toggle (port select)\n", touchX, touchY);
+        handleTestToggleTap();
+        return;
+    }
+
     bool inBack = touchX >= SELECT_BACK_X && touchX < SELECT_BACK_X + SELECT_BACK_W && touchY >= SELECT_BACK_Y &&
                   touchY < SELECT_BACK_Y + SELECT_BACK_H;
     if (inBack) {
         Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> port select BACK -> hub select\n", touchX, touchY);
-        // WO10 Step 1 design choice (reported per the order): Back
-        // clears the full context rather than persisting the hub
-        // selection - hub select is always a clean slate on re-entry,
-        // never partially-stale.
+        // WO10 Step 1 design choice (reported per the order): clears
+        // the current SELECTION (device/port/capture) rather than
+        // persisting it - hub select is always a clean slate on
+        // re-entry. WO10-FINAL: deliberately still selection-only, NOT
+        // a full clearEditorSession() - the pending session (other
+        // ports' committed edits) must survive navigating hub<->port to
+        // focus a different port, or "accumulate across ports" breaks.
         clearEditContext();
         goToPage(PAGE_EDIT_SELECT);
         return;
@@ -822,23 +1035,11 @@ static void dispatchPortSelectTouch(int16_t touchX, int16_t touchY) {
 // the removed PAGE_EDIT_CAPTURE cases in editorBackTarget()/
 // editorNextTarget()/pageHasNext() below).
 //
-// Mirrors mkh_config.c's kInputTokens strings (LSNS/RSNS) rather than
-// exposing input_token_name() (private to mkh_config.c) - same
-// restate-don't-touch-the-file approach as WO11's MK1_TELEGRAM_RATE_
-// LABEL and WO10 Step 1's MKH_EDIT_MAX_ACTIVE_DEVICE. mkh_config.c
-// currently defines NO button tokens at all (LSNS/RSNS only, both
-// stick axes) - there is nothing for a button press to be captured as
-// yet; see checkCapture() further down for where that shows up.
-static const char* mkhCaptureTokenLabel(mkh_input_source_t token) {
-    switch (token) {
-        case MKH_INPUT_LSNS:
-            return "LSNS";
-        case MKH_INPUT_RSNS:
-            return "RSNS";
-        default:
-            return "NONE";
-    }
-}
+// WO10-FINAL rev B: token display now goes through the public
+// mkh_config_input_token_name() accessor instead of a local mirror
+// table (Step 2's mkhCaptureTokenLabel(), removed) - with 18 tokens
+// instead of 2, keeping a second hand-synced copy in sketch.cpp stopped
+// being worth it; one source of truth in mkh_config.c now.
 
 // Rebuilt-page geometry (order: "the old 10px-margin placeholder
 // buttons die here") - same >=40px short dimension / >=20px edge margin
@@ -888,7 +1089,7 @@ static void drawCaptureStatus() {
     display->setTextColor(COLOR_LABEL);
     if (editCtx.capture_valid) {
         char line[24];
-        snprintf(line, sizeof(line), "CAPTURED: %s", mkhCaptureTokenLabel(editCtx.captured_input));
+        snprintf(line, sizeof(line), "CAPTURED: %s", mkh_config_input_token_name(editCtx.captured_input));
         display->setTextSize(3);
         display->setCursor((SCR_W - textWidth(line, 3)) / 2, CAPTURE_STATUS_Y);
         display->print(line);
@@ -914,6 +1115,7 @@ static void drawCapturePage(const char* title) {
 
     drawCaptureStatus();
     drawCaptureButtons();
+    drawTestToggle();
 }
 
 static void drawCapturePromptOverlay() {
@@ -954,6 +1156,12 @@ static void dispatchCaptureTouch(int16_t touchX, int16_t touchY) {
         return;
     }
 
+    if (testToggleHit(touchX, touchY)) {
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> Test toggle (capture)\n", touchX, touchY);
+        handleTestToggleTap();
+        return;
+    }
+
     if (inLeftBtn) {
         if (editCtx.capture_valid) {
             Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> capture BACK, prompting (capture set)\n", touchX,
@@ -970,6 +1178,308 @@ static void dispatchCaptureTouch(int16_t touchX, int16_t touchY) {
         // already sitting in editCtx; there is nothing more to commit).
         Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> capture NEXT -> settings\n", touchX, touchY);
         goToPage(PAGE_EDIT_SETTINGS);
+    }
+}
+
+// WO10-FINAL: settings page. Replaces the placeholder wholesale, same
+// custom render/dispatch pattern as hub/port/capture. INPUT's own
+// commit into the pending session happens on ENTRY (goToPage()'s
+// PAGE_EDIT_SETTINGS case, below) - same "reaching this page implies
+// keep" precedent as capture's NEXT. invert/max/mode are still
+// "uncommitted" scratch on THIS page - settingsBaseline* is what
+// they're compared against on Back to decide whether to prompt.
+static bool settingsWorkingInvert = false;
+static uint8_t settingsWorkingMax = 100;
+static mkh_input_mode_t settingsWorkingMode = MKH_MODE_PROPORTIONAL;
+static bool settingsBaselineInvert = false;
+static uint8_t settingsBaselineMax = 100;
+static mkh_input_mode_t settingsBaselineMode = MKH_MODE_PROPORTIONAL;
+static bool settingsPromptActive = false;
+
+static const int16_t SPAGE_INPUT_Y = 26;
+static const int16_t SPAGE_INVERT_HIT_Y = 44;
+static const int16_t SPAGE_INVERT_HIT_H = 28;
+static const int16_t SPAGE_INVERT_TRACK_X = 200;
+static const int16_t SPAGE_MODE_HIT_Y = 74;
+static const int16_t SPAGE_MODE_HIT_H = 28;
+static const int16_t SPAGE_MAX_LABEL_Y = 106;
+static const int16_t SPAGE_SLIDER_X = 20;         // left edge 20, 20px from screen edge (0)
+static const int16_t SPAGE_SLIDER_W = 280;         // right edge 300, 20px from screen edge (320)
+static const int16_t SPAGE_SLIDER_HIT_Y = 124;
+static const int16_t SPAGE_SLIDER_HIT_H = 40;        // short dimension - exactly the 40px minimum
+static const int16_t SPAGE_SLIDER_TRACK_Y = 138;      // thinner visual track, centered in the hit band
+static const int16_t SPAGE_SLIDER_TRACK_H = 12;
+static const int16_t SPAGE_CURVE_Y = 168;
+
+static const int16_t SPAGE_BACK_X = 20;
+static const int16_t SPAGE_RESET_X = 120;
+static const int16_t SPAGE_SAVE_X = 220;
+static const int16_t SPAGE_BTN_W = 80;
+static const int16_t SPAGE_BTN_Y = 180;
+static const int16_t SPAGE_BTN_H = 40;  // bottom=220, 20px from screen edge (240)
+
+static void drawSettingsInvertRow() {
+    display->fillRect(0, SPAGE_INVERT_HIT_Y, SCR_W, SPAGE_INVERT_HIT_H, COLOR_BG);
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(1);
+    display->setCursor(20, SPAGE_INVERT_HIT_Y + (SPAGE_INVERT_HIT_H - 8) / 2);
+    display->print("INVERT");
+
+    // Same pill-track+knob visual style as the dashboard's MKH switches
+    // (SWITCH_TRACK_W/H/SWITCH_KNOB_R/SWITCH_PAD, reused as-is) - a
+    // small parallel function rather than a refactor of the dashboard's
+    // own rowTop()-tied drawToggleSwitch(), to avoid touching dashboard-
+    // critical rendering code for an unrelated page.
+    int16_t trackTop = SPAGE_INVERT_HIT_Y + (SPAGE_INVERT_HIT_H - SWITCH_TRACK_H) / 2;
+    int16_t knobCy = trackTop + SWITCH_TRACK_H / 2;
+    int16_t knobCx = settingsWorkingInvert ? (SPAGE_INVERT_TRACK_X + SWITCH_TRACK_W - SWITCH_KNOB_R - SWITCH_PAD)
+                                            : (SPAGE_INVERT_TRACK_X + SWITCH_KNOB_R + SWITCH_PAD);
+    uint16_t trackColor = settingsWorkingInvert ? COLOR_GREEN : COLOR_RED;
+    display->fillRoundRect(SPAGE_INVERT_TRACK_X, trackTop, SWITCH_TRACK_W, SWITCH_TRACK_H, SWITCH_TRACK_H / 2,
+                            trackColor);
+    display->fillCircle(knobCx, knobCy, SWITCH_KNOB_R, COLOR_LABEL);
+}
+
+static const char* modeShortLabel(mkh_input_mode_t mode) {
+    switch (mode) {
+        case MKH_MODE_PROPORTIONAL:
+            return "PROPORTIONAL";
+        case MKH_MODE_MOMENTARY:
+            return "MOMENTARY";
+        case MKH_MODE_LATCHED:
+            return "LATCHED";
+        default:
+            return "?";
+    }
+}
+
+// 2-state cycle for digitals (MOMENTARY<->LATCHED - no proportional
+// option, order: "buttons/dpad/stick-clicks = momentary (default) |
+// latched"); 3-state cycle for triggers (PROPORTIONAL->MOMENTARY->
+// LATCHED->...). Never called for MKH_INPUT_CLASS_AXIS - that row is
+// hidden entirely (order: "hidden/disabled for stick axes").
+static mkh_input_mode_t nextModeFor(mkh_input_class_t cls, mkh_input_mode_t current) {
+    if (cls == MKH_INPUT_CLASS_TRIGGER) {
+        switch (current) {
+            case MKH_MODE_PROPORTIONAL:
+                return MKH_MODE_MOMENTARY;
+            case MKH_MODE_MOMENTARY:
+                return MKH_MODE_LATCHED;
+            default:
+                return MKH_MODE_PROPORTIONAL;
+        }
+    }
+    return (current == MKH_MODE_LATCHED) ? MKH_MODE_MOMENTARY : MKH_MODE_LATCHED;
+}
+
+// WO10-FINAL rev B mode control: CC's widget judgment (reported) - a
+// single "tap row to cycle" control showing the current mode as text,
+// used for BOTH the 2-state (digital) and 3-state (trigger) cases
+// rather than a true graphical pill/segmented-control, since a plain
+// on/off pill has no natural 3-position analogue and building two
+// different widget shapes for what's functionally the same interaction
+// (tap, see the next state) wasn't worth the extra code. Hidden
+// entirely for MKH_INPUT_CLASS_AXIS ports - "no mode" is represented by
+// the row simply not existing, not a disabled-but-visible state.
+static void drawSettingsModeRow() {
+    display->fillRect(0, SPAGE_MODE_HIT_Y, SCR_W, SPAGE_MODE_HIT_H, COLOR_BG);
+    if (mkh_config_input_class(editCtx.captured_input) == MKH_INPUT_CLASS_AXIS) {
+        return;
+    }
+    char line[24];
+    snprintf(line, sizeof(line), "MODE: %s", modeShortLabel(settingsWorkingMode));
+    display->drawRect(4, SPAGE_MODE_HIT_Y + 2, SCR_W - 8, SPAGE_MODE_HIT_H - 4, COLOR_CARD_BORDER);
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(1);
+    display->setCursor(20, SPAGE_MODE_HIT_Y + (SPAGE_MODE_HIT_H - 8) / 2);
+    display->print(line);
+}
+
+static void drawSettingsMaxRow() {
+    display->fillRect(0, SPAGE_MAX_LABEL_Y - 2, SCR_W, 20, COLOR_BG);
+    char label[16];
+    snprintf(label, sizeof(label), "MAX: %u%%", (unsigned)settingsWorkingMax);
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(2);
+    display->setCursor(20, SPAGE_MAX_LABEL_Y);
+    display->print(label);
+
+    display->fillRect(SPAGE_SLIDER_X, SPAGE_SLIDER_TRACK_Y, SPAGE_SLIDER_W, SPAGE_SLIDER_TRACK_H, COLOR_CARD_BG);
+    display->drawRect(SPAGE_SLIDER_X, SPAGE_SLIDER_TRACK_Y, SPAGE_SLIDER_W, SPAGE_SLIDER_TRACK_H, COLOR_CARD_BORDER);
+    int16_t fillW = (int16_t)(((int32_t)SPAGE_SLIDER_W * settingsWorkingMax) / 100);
+    if (fillW > 0) {
+        display->fillRect(SPAGE_SLIDER_X, SPAGE_SLIDER_TRACK_Y, fillW, SPAGE_SLIDER_TRACK_H, COLOR_GREEN);
+    }
+}
+
+static void drawSettingsButtons() {
+    display->fillRect(0, SPAGE_BTN_Y - 4, SCR_W, SPAGE_BTN_H + 8, COLOR_BG);
+    drawButtonAt(SPAGE_BACK_X, SPAGE_BTN_Y, SPAGE_BTN_W, SPAGE_BTN_H, "BACK");
+    drawButtonAt(SPAGE_RESET_X, SPAGE_BTN_Y, SPAGE_BTN_W, SPAGE_BTN_H, "RESET");
+    drawButtonAt(SPAGE_SAVE_X, SPAGE_BTN_Y, SPAGE_BTN_W, SPAGE_BTN_H, "SAVE");
+}
+
+static void drawSettingsPage() {
+    display->fillScreen(COLOR_BG);
+
+    char title[32];
+    if (editCtx.selected_valid) {
+        snprintf(title, sizeof(title), "MKH%d - Port %c", mkh_device_app_number(editCtx.selected_device),
+                 mkh_port_letter(editCtx.selected_port));
+    } else {
+        snprintf(title, sizeof(title), "EDIT: PORT SETTINGS");
+    }
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(2);
+    display->setCursor((SCR_W - textWidth(title, 2)) / 2, 8);
+    display->print(title);
+
+    char inputLine[24];
+    snprintf(inputLine, sizeof(inputLine), "INPUT: %s", mkh_config_input_token_name(editCtx.captured_input));
+    display->setTextSize(2);
+    display->setCursor(20, SPAGE_INPUT_Y);
+    display->print(inputLine);
+
+    drawSettingsInvertRow();
+    drawSettingsModeRow();
+    drawSettingsMaxRow();
+
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(1);
+    display->setCursor(20, SPAGE_CURVE_Y);
+    display->print("CURVE: LINEAR");  // v1: not selectable, see mkh_config.h
+
+    settingsPromptActive = false;
+    drawSettingsButtons();
+    drawTestToggle();
+}
+
+static void drawSettingsPromptOverlay() {
+    const char* q = "KEEP CHANGES?";
+    display->fillRect(0, SPAGE_CURVE_Y - 4, SCR_W, 24, COLOR_BG);
+    display->setTextColor(COLOR_YELLOW);
+    display->setTextSize(2);
+    display->setCursor((SCR_W - textWidth(q, 2)) / 2, SPAGE_CURVE_Y - 2);
+    display->print(q);
+
+    display->fillRect(0, SPAGE_BTN_Y - 4, SCR_W, SPAGE_BTN_H + 8, COLOR_BG);
+    drawButtonAt(EXIT_PROMPT_LEFT_X, SPAGE_BTN_Y, EXIT_PROMPT_LEFT_W, SPAGE_BTN_H, "KEEP");
+    drawButtonAt(EXIT_PROMPT_RIGHT_X, SPAGE_BTN_Y, EXIT_PROMPT_RIGHT_W, SPAGE_BTN_H, "DISCARD");
+}
+
+// Settings page's own hit zones + its leave-page prompt's, same
+// separation rationale as the other custom pages.
+static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
+    int dev = editCtx.selected_device;
+    int port = editCtx.selected_port;
+    mkh_input_class_t cls = mkh_config_input_class(editCtx.captured_input);
+
+    if (settingsPromptActive) {
+        bool inKeep = touchX >= EXIT_PROMPT_LEFT_X && touchX < EXIT_PROMPT_LEFT_X + EXIT_PROMPT_LEFT_W &&
+                      touchY >= SPAGE_BTN_Y && touchY < SPAGE_BTN_Y + SPAGE_BTN_H;
+        bool inDiscard = touchX >= EXIT_PROMPT_RIGHT_X && touchX < EXIT_PROMPT_RIGHT_X + EXIT_PROMPT_RIGHT_W &&
+                         touchY >= SPAGE_BTN_Y && touchY < SPAGE_BTN_Y + SPAGE_BTN_H;
+        if (inKeep) {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings prompt KEEP\n", touchX, touchY);
+            pendingEdits[dev][port].invert = settingsWorkingInvert;
+            pendingEdits[dev][port].max_percent = settingsWorkingMax;
+            pendingEdits[dev][port].mode = settingsWorkingMode;
+            settingsPromptActive = false;
+            goToPage(PAGE_EDIT_CAPTURE);
+        } else if (inDiscard) {
+            // pendingEdits[dev][port] already holds the pre-visit
+            // baseline (committed on entry) - simply not overwriting it
+            // with the working scratch IS the discard.
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings prompt DISCARD\n", touchX, touchY);
+            settingsPromptActive = false;
+            goToPage(PAGE_EDIT_CAPTURE);
+        }
+        return;
+    }
+
+    if (testToggleHit(touchX, touchY)) {
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> Test toggle (settings)\n", touchX, touchY);
+        handleTestToggleTap();
+        return;
+    }
+
+    if (touchY >= SPAGE_INVERT_HIT_Y && touchY < SPAGE_INVERT_HIT_Y + SPAGE_INVERT_HIT_H) {
+        settingsWorkingInvert = !settingsWorkingInvert;
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings INVERT -> %s\n", touchX, touchY,
+                        settingsWorkingInvert ? "yes" : "no");
+        drawSettingsInvertRow();
+        return;
+    }
+
+    if (cls != MKH_INPUT_CLASS_AXIS && touchY >= SPAGE_MODE_HIT_Y && touchY < SPAGE_MODE_HIT_Y + SPAGE_MODE_HIT_H) {
+        settingsWorkingMode = nextModeFor(cls, settingsWorkingMode);
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings MODE -> %s\n", touchX, touchY,
+                        modeShortLabel(settingsWorkingMode));
+        drawSettingsModeRow();
+        return;
+    }
+
+    if (touchX >= SPAGE_SLIDER_X && touchX < SPAGE_SLIDER_X + SPAGE_SLIDER_W && touchY >= SPAGE_SLIDER_HIT_Y &&
+        touchY < SPAGE_SLIDER_HIT_Y + SPAGE_SLIDER_HIT_H) {
+        int32_t rel = touchX - SPAGE_SLIDER_X;
+        if (rel < 0)
+            rel = 0;
+        if (rel > SPAGE_SLIDER_W)
+            rel = SPAGE_SLIDER_W;
+        settingsWorkingMax = (uint8_t)((rel * 100) / SPAGE_SLIDER_W);
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings MAX slider -> %u%%\n", touchX, touchY,
+                        (unsigned)settingsWorkingMax);
+        drawSettingsMaxRow();
+        return;
+    }
+
+    bool inBack = touchX >= SPAGE_BACK_X && touchX < SPAGE_BACK_X + SPAGE_BTN_W && touchY >= SPAGE_BTN_Y &&
+                  touchY < SPAGE_BTN_Y + SPAGE_BTN_H;
+    bool inReset = touchX >= SPAGE_RESET_X && touchX < SPAGE_RESET_X + SPAGE_BTN_W && touchY >= SPAGE_BTN_Y &&
+                   touchY < SPAGE_BTN_Y + SPAGE_BTN_H;
+    bool inSave = touchX >= SPAGE_SAVE_X && touchX < SPAGE_SAVE_X + SPAGE_BTN_W && touchY >= SPAGE_BTN_Y &&
+                  touchY < SPAGE_BTN_Y + SPAGE_BTN_H;
+
+    if (inBack) {
+        bool dirty = (settingsWorkingInvert != settingsBaselineInvert) ||
+                     (settingsWorkingMax != settingsBaselineMax) || (settingsWorkingMode != settingsBaselineMode);
+        if (dirty) {
+            Console.printf(
+                "MK1 Touch: tap display=(x=%d,y=%d) -> settings BACK, prompting (uncommitted edits)\n", touchX,
+                touchY);
+            settingsPromptActive = true;
+            drawSettingsPromptOverlay();
+        } else {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings BACK, silent (no uncommitted edits)\n",
+                            touchX, touchY);
+            goToPage(PAGE_EDIT_CAPTURE);
+        }
+    } else if (inReset) {
+        // Order: "Reset (settings page) restores saved config to the
+        // table and clears the session." CC's judgment (reported):
+        // stays on the settings page rather than navigating away,
+        // refreshing this port's fields from the just-reloaded table -
+        // a form-reset, not an exit.
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings RESET\n", touchX, touchY);
+        mkh_storage_reload_config();
+        clearPendingSession();
+        testActive = false;
+        const mkh_port_config_t* cfg = mkh_config_get(dev, port);
+        editCtx.captured_input = cfg ? cfg->input : MKH_INPUT_NONE;
+        editCtx.capture_valid = (cfg != nullptr) && (cfg->input != MKH_INPUT_NONE);
+        settingsWorkingInvert = cfg ? cfg->invert : false;
+        settingsWorkingMax = cfg ? cfg->max_percent : 100;
+        settingsWorkingMode = cfg ? cfg->mode : MKH_MODE_PROPORTIONAL;
+        settingsBaselineInvert = settingsWorkingInvert;
+        settingsBaselineMax = settingsWorkingMax;
+        settingsBaselineMode = settingsWorkingMode;
+        drawSettingsPage();
+    } else if (inSave) {
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings SAVE\n", touchX, touchY);
+        pendingEdits[dev][port].invert = settingsWorkingInvert;
+        pendingEdits[dev][port].max_percent = settingsWorkingMax;
+        pendingEdits[dev][port].mode = settingsWorkingMode;
+        performSaveAndExit();
     }
 }
 
@@ -1017,9 +1527,38 @@ static void goToPage(UiPage page) {
             drawCapturePage(title);
             break;
         }
-        case PAGE_EDIT_SETTINGS:
-            drawEditorPlaceholder("EDIT: PORT SETTINGS", page);
+        case PAGE_EDIT_SETTINGS: {
+            // WO10-FINAL: reaching settings is an implicit keep of the
+            // captured input - same precedent as capture's NEXT never
+            // prompting - so it commits into the pending session right
+            // here, on entry. Seeds invert/max/mode from any existing
+            // pending edit for this port (a revisit keeps prior
+            // tweaks), else from the currently resolved config (first
+            // visit this session); mode falls back to the type-
+            // appropriate default (mkh_config.c) if neither exists.
+            int dev = editCtx.selected_device;
+            int port = editCtx.selected_port;
+            if (pendingEdits[dev][port].dirty) {
+                settingsWorkingInvert = pendingEdits[dev][port].invert;
+                settingsWorkingMax = pendingEdits[dev][port].max_percent;
+                settingsWorkingMode = pendingEdits[dev][port].mode;
+            } else {
+                const mkh_port_config_t* cfg = mkh_config_get(dev, port);
+                settingsWorkingInvert = cfg ? cfg->invert : false;
+                settingsWorkingMax = cfg ? cfg->max_percent : 100;
+                settingsWorkingMode = cfg ? cfg->mode : MKH_MODE_PROPORTIONAL;
+            }
+            pendingEdits[dev][port].dirty = true;
+            pendingEdits[dev][port].input = editCtx.captured_input;
+            pendingEdits[dev][port].invert = settingsWorkingInvert;
+            pendingEdits[dev][port].max_percent = settingsWorkingMax;
+            pendingEdits[dev][port].mode = settingsWorkingMode;
+            settingsBaselineInvert = settingsWorkingInvert;
+            settingsBaselineMax = settingsWorkingMax;
+            settingsBaselineMode = settingsWorkingMode;
+            drawSettingsPage();
             break;
+        }
         case PAGE_COUNT:
             break;
     }
@@ -1176,6 +1715,154 @@ static uint8_t mkApplyPortConfig(uint8_t rawByte, const mkh_port_config_t* cfg) 
     return (uint8_t)value;
 }
 
+// WO10-FINAL rev B: analog trigger -> MK6 byte, one-sided (0x80 at rest
+// ramping up to 0xFF at full pull) unlike the sticks' bidirectional
+// mkStickYToChannelByte() - a trigger has no "reverse" reading to
+// represent. Bluepad32's brake()/throttle() range is 0..1023 (verified
+// against the existing dumpGamepad() comment, which already documented
+// this range before this order). Same MKH_STICK_DEADZONE_PERCENT
+// reused for consistency, applied to the 1023 magnitude instead of 512.
+static uint8_t mkTriggerToChannelByte(int32_t triggerValue) {
+    const int32_t magnitude = 1023;
+    const int32_t deadzone = (magnitude * MKH_STICK_DEADZONE_PERCENT) / 100;
+
+    if (triggerValue <= deadzone) {
+        return 0x80;
+    }
+
+    int32_t travel = magnitude - deadzone;
+    float fraction = (float)(triggerValue - deadzone) / (float)travel;
+    if (fraction > 1.0f)
+        fraction = 1.0f;
+
+    int value = 128 + (int)lroundf(fraction * 127.0f);
+    if (value > 0xFF)
+        value = 0xFF;
+    return (uint8_t)value;
+}
+
+// WO10-FINAL rev B: latch state - runtime-only ("never persisted, boots
+// off" per the order), tracked per port (not per token) since two ports
+// could in principle latch the same physical input independently.
+// latchPrevPressed[] is the edge detector: a latch toggles on the
+// press EDGE, not the level, so holding the button doesn't rapidly
+// re-toggle every ~150ms loop tick.
+static bool latchState[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS];
+static bool latchPrevPressed[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS];
+
+static void clearLatchStateForDevice(int dev) {
+    for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++) {
+        latchState[dev][p] = false;
+        latchPrevPressed[dev][p] = false;
+    }
+}
+
+static void clearAllLatchState() {
+    for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++) {
+        clearLatchStateForDevice(d);
+    }
+}
+
+// Reads one token's raw controller value: Bluepad32's native -512..511
+// range for MKH_INPUT_CLASS_AXIS tokens, 0..1023 for MKH_INPUT_CLASS_
+// TRIGGER tokens, or 0/1 for MKH_INPUT_CLASS_DIGITAL tokens. Callers
+// interpret the range themselves based on mkh_config_input_class() -
+// this function only reads, it doesn't scale or threshold anything.
+static int32_t readTokenRaw(ControllerPtr ctl, mkh_input_source_t token) {
+    switch (token) {
+        case MKH_INPUT_LSNS:
+            return ctl->axisY();
+        case MKH_INPUT_LSEW:
+            return ctl->axisX();
+        case MKH_INPUT_RSNS:
+            return ctl->axisRY();
+        case MKH_INPUT_RSEW:
+            return ctl->axisRX();
+        case MKH_INPUT_LT:
+            return ctl->brake();
+        case MKH_INPUT_RT:
+            return ctl->throttle();
+        case MKH_INPUT_BTN_A:
+            return ctl->a() ? 1 : 0;
+        case MKH_INPUT_BTN_B:
+            return ctl->b() ? 1 : 0;
+        case MKH_INPUT_BTN_X:
+            return ctl->x() ? 1 : 0;
+        case MKH_INPUT_BTN_Y:
+            return ctl->y() ? 1 : 0;
+        case MKH_INPUT_LB:
+            return ctl->l1() ? 1 : 0;
+        case MKH_INPUT_RB:
+            return ctl->r1() ? 1 : 0;
+        case MKH_INPUT_DPAD_UP:
+            return (ctl->dpad() & DPAD_UP) ? 1 : 0;
+        case MKH_INPUT_DPAD_DOWN:
+            return (ctl->dpad() & DPAD_DOWN) ? 1 : 0;
+        case MKH_INPUT_DPAD_LEFT:
+            return (ctl->dpad() & DPAD_LEFT) ? 1 : 0;
+        case MKH_INPUT_DPAD_RIGHT:
+            return (ctl->dpad() & DPAD_RIGHT) ? 1 : 0;
+        case MKH_INPUT_L3:
+            return ctl->thumbL() ? 1 : 0;
+        case MKH_INPUT_R3:
+            return ctl->thumbR() ? 1 : 0;
+        default:
+            return 0;
+    }
+}
+
+// WO10-FINAL rev B: the full-universe drive sweep, replacing v0.8.0
+// Step 2's stick-only version. Every assigned port is driven every
+// call regardless of mode - proportional inputs scale continuously,
+// momentary is a simple pressed/released level, latched toggles on a
+// press edge and otherwise holds (see latchState[]/latchPrevPressed[]
+// above). All three funnel through the SAME mkApplyPortConfig()
+// invert/max pipeline (order: "all through the existing invert/max
+// pipeline") - only the pre-pipeline raw byte differs by class/mode.
+static void processMappedInputs(ControllerPtr ctl) {
+    for (int dev = 0; dev < MKH_MK6_NUM_DEVICES; dev++) {
+        for (int port = 0; port < MKH_MK6_NUM_CHANNELS; port++) {
+            const mkh_port_config_t* cfg = mkh_config_get(dev, port);
+            if (!cfg || cfg->input == MKH_INPUT_NONE)
+                continue;
+
+            mkh_input_class_t cls = mkh_config_input_class(cfg->input);
+            uint8_t rawByte;
+
+            if (cls == MKH_INPUT_CLASS_AXIS) {
+                // Stick axes: no mode, always proportional (order) -
+                // cfg->mode is never consulted here, regardless of what
+                // it happens to hold.
+                rawByte = mkStickYToChannelByte(readTokenRaw(ctl, cfg->input));
+            } else if (cls == MKH_INPUT_CLASS_TRIGGER && cfg->mode == MKH_MODE_PROPORTIONAL) {
+                rawByte = mkTriggerToChannelByte(readTokenRaw(ctl, cfg->input));
+            } else {
+                // DIGITAL, or a TRIGGER explicitly set to momentary/
+                // latched - both resolve to a simple pressed/not level.
+                // Triggers use half-travel (511 of 1023) as the
+                // pressed/not-pressed split point for momentary/latched
+                // mode - CC's judgment, not specified by the order.
+                bool pressed = (cls == MKH_INPUT_CLASS_TRIGGER) ? (readTokenRaw(ctl, cfg->input) > (1023 / 2))
+                                                                 : (readTokenRaw(ctl, cfg->input) != 0);
+
+                if (cfg->mode == MKH_MODE_LATCHED) {
+                    if (pressed && !latchPrevPressed[dev][port]) {
+                        latchState[dev][port] = !latchState[dev][port];
+                    }
+                    latchPrevPressed[dev][port] = pressed;
+                    rawByte = latchState[dev][port] ? 0xFF : 0x80;
+                } else {
+                    // MOMENTARY - the only other legal mode for a
+                    // digital; for a trigger, the explicit momentary case.
+                    rawByte = pressed ? 0xFF : 0x80;
+                }
+            }
+
+            mkh_set_channel(dev, port, mkApplyPortConfig(rawByte, cfg));
+        }
+    }
+}
+
 // This callback gets called any time a new gamepad is connected.
 // Up to 4 gamepads can be connected at the same time.
 void onConnectedController(ControllerPtr ctl) {
@@ -1232,6 +1919,16 @@ void onDisconnectedController(ControllerPtr ctl) {
                 // mkh_broadcast.c), so this write is a redundant no-op
                 // for it, not a gap. Either way, no device can resume
                 // from a stale non-neutral value after XWC disconnects.
+                //
+                // WO10-FINAL rev B: "failsafe absolute" - neutralizes
+                // ALL ports including latched-on, clears all latch
+                // state, no exceptions for any token type. The
+                // unconditional mkh_set_channel(...,0x80) below already
+                // covers "neutralize latched-on" (a latch's live output
+                // IS just 0x80/0xFF through the same pipeline as
+                // everything else - see processMappedInputs()); this
+                // adds the other half, clearing our own latch tracking
+                // so a reconnect doesn't resume already-latched.
                 for (int dev = 0; dev < MKH_MK6_NUM_DEVICES; dev++) {
                     for (int port = 0; port < MKH_MK6_NUM_CHANNELS; port++) {
                         const mkh_port_config_t* cfg = mkh_config_get(dev, port);
@@ -1240,6 +1937,7 @@ void onDisconnectedController(ControllerPtr ctl) {
                         }
                     }
                 }
+                clearAllLatchState();
             }
             break;
         }
@@ -1336,26 +2034,13 @@ void dumpBalanceBoard(ControllerPtr ctl) {
 
 void processGamepad(ControllerPtr ctl) {
     if (ctl->index() == 0) {
-        // v0.8.0 Step 2: left stick Y = MKH_INPUT_LSNS, right stick Y =
-        // MKH_INPUT_RSNS, applied to whichever device/port slot(s) the
-        // config table currently assigns each input source to - see
-        // mkh_config.h. Default config reproduces v0.7.0 exactly (HUB1
-        // port A = LSNS, HUB2 port A = RSNS, invert=no, max=100).
-        uint8_t leftRawByte = mkStickYToChannelByte(ctl->axisY());
-        uint8_t rightRawByte = mkStickYToChannelByte(ctl->axisRY());
-
-        for (int dev = 0; dev < MKH_MK6_NUM_DEVICES; dev++) {
-            for (int port = 0; port < MKH_MK6_NUM_CHANNELS; port++) {
-                const mkh_port_config_t* cfg = mkh_config_get(dev, port);
-                if (!cfg)
-                    continue;
-                if (cfg->input == MKH_INPUT_LSNS) {
-                    mkh_set_channel(dev, port, mkApplyPortConfig(leftRawByte, cfg));
-                } else if (cfg->input == MKH_INPUT_RSNS) {
-                    mkh_set_channel(dev, port, mkApplyPortConfig(rightRawByte, cfg));
-                }
-            }
-        }
+        // v0.8.0 Step 2 / WO10-FINAL rev B: which device/port slot(s)
+        // each token drives is resolved at runtime from the config
+        // table (mkh_config_get()) - see processMappedInputs() above
+        // for the full 18-token, mode-aware sweep. Default config still
+        // reproduces v0.7.0 exactly (HUB1 port A = LSNS, HUB2 port A =
+        // RSNS, invert=no, max=100, proportional).
+        processMappedInputs(ctl);
     }
 
     // There are different ways to query whether a button is pressed.
@@ -1495,12 +2180,19 @@ void processControllers() {
 // above any resting/analog noise the deadzone itself doesn't already
 // absorb, while still being a modest, not-full-deflection push that
 // any deliberate "wiggle" clears without requiring precision from the
-// user.
+// user. Reused as-is (same percentage) for trigger capture below.
 #define MKH_CAPTURE_THRESHOLD_PERCENT 25
 
 static bool stickPastCaptureThreshold(int32_t axisValue) {
     const int32_t threshold = (MKH_STICK_AXIS_MAGNITUDE * MKH_CAPTURE_THRESHOLD_PERCENT) / 100;
     return axisValue <= -threshold || axisValue >= threshold;
+}
+
+// Triggers are 0..1023, one-sided (0=released) - see mkTriggerToChannelByte()
+// above for the same range used in the drive sweep.
+static bool triggerPastCaptureThreshold(int32_t triggerValue) {
+    const int32_t threshold = (1023 * MKH_CAPTURE_THRESHOLD_PERCENT) / 100;
+    return triggerValue >= threshold;
 }
 
 // Applies a new capture, but only if it actually changes anything -
@@ -1513,13 +2205,22 @@ static void applyCapture(mkh_input_source_t token) {
     bool hadCapture = editCtx.capture_valid;
     editCtx.captured_input = token;
     editCtx.capture_valid = true;
-    Console.printf("MK1 Capture: %s captured\n", mkhCaptureTokenLabel(token));
+    Console.printf("MK1 Capture: %s captured\n", mkh_config_input_token_name(token));
     drawCaptureStatus();
     if (!hadCapture) {
         drawCaptureButtons();  // NEXT appears for the first time
     }
 }
 
+// WO10-FINAL rev B: extended from stick-only to the full 18-token
+// universe. Axes/triggers capture past MKH_CAPTURE_THRESHOLD_PERCENT;
+// every digital captures on a plain press (order: "digital inputs on
+// press") - no threshold concept applies to a boolean. Checked in a
+// fixed order (axes, then triggers, then digitals) - "first past
+// threshold wins" only matters for same-tick ties, which this order
+// resolves the same deterministic way every time; it does not mean any
+// one input is preferred once a session is underway (re-capture always
+// overwrites, per applyCapture() above).
 static void checkCapture() {
     ControllerPtr ctl = myControllers[0];
     if (!ctl || !ctl->isConnected())
@@ -1529,18 +2230,74 @@ static void checkCapture() {
         applyCapture(MKH_INPUT_LSNS);
         return;
     }
+    if (stickPastCaptureThreshold(ctl->axisX())) {
+        applyCapture(MKH_INPUT_LSEW);
+        return;
+    }
     if (stickPastCaptureThreshold(ctl->axisRY())) {
         applyCapture(MKH_INPUT_RSNS);
         return;
     }
-    // Buttons: mkh_config.c's kInputTokens currently defines LSNS/RSNS
-    // only (both stick axes) - there is no button token to check
-    // against yet, so every button press correctly falls through as
-    // ignored here. Not a stub or a gap: per the order, "inputs without
-    // config tokens are ignored (no capture, no error)," and right now
-    // that's every button. Add a check here (paired with a new token in
-    // mkh_config.c/mkh_config.h) if/when a future order defines one -
-    // "do not invent new tokens" is why this step doesn't.
+    if (stickPastCaptureThreshold(ctl->axisRX())) {
+        applyCapture(MKH_INPUT_RSEW);
+        return;
+    }
+    if (triggerPastCaptureThreshold(ctl->brake())) {
+        applyCapture(MKH_INPUT_LT);
+        return;
+    }
+    if (triggerPastCaptureThreshold(ctl->throttle())) {
+        applyCapture(MKH_INPUT_RT);
+        return;
+    }
+    if (ctl->a()) {
+        applyCapture(MKH_INPUT_BTN_A);
+        return;
+    }
+    if (ctl->b()) {
+        applyCapture(MKH_INPUT_BTN_B);
+        return;
+    }
+    if (ctl->x()) {
+        applyCapture(MKH_INPUT_BTN_X);
+        return;
+    }
+    if (ctl->y()) {
+        applyCapture(MKH_INPUT_BTN_Y);
+        return;
+    }
+    if (ctl->l1()) {
+        applyCapture(MKH_INPUT_LB);
+        return;
+    }
+    if (ctl->r1()) {
+        applyCapture(MKH_INPUT_RB);
+        return;
+    }
+    if (ctl->dpad() & DPAD_UP) {
+        applyCapture(MKH_INPUT_DPAD_UP);
+        return;
+    }
+    if (ctl->dpad() & DPAD_DOWN) {
+        applyCapture(MKH_INPUT_DPAD_DOWN);
+        return;
+    }
+    if (ctl->dpad() & DPAD_LEFT) {
+        applyCapture(MKH_INPUT_DPAD_LEFT);
+        return;
+    }
+    if (ctl->dpad() & DPAD_RIGHT) {
+        applyCapture(MKH_INPUT_DPAD_RIGHT);
+        return;
+    }
+    if (ctl->thumbL()) {
+        applyCapture(MKH_INPUT_L3);
+        return;
+    }
+    if (ctl->thumbR()) {
+        applyCapture(MKH_INPUT_R3);
+        return;
+    }
 }
 
 // Arduino setup function. Runs in CPU 1
@@ -1673,16 +2430,22 @@ void loop() {
     int16_t touchX, touchY;
     if (mkh_touch_poll(&touchX, &touchY)) {
         if (currentPage == PAGE_DASHBOARD) {
-            bool inSettingsBtn = touchX >= SETTINGS_BTN_X && touchX < SETTINGS_BTN_X + SETTINGS_BTN_W &&
-                                  touchY >= SETTINGS_BTN_Y && touchY < SETTINGS_BTN_Y + SETTINGS_BTN_H;
+            // WO10 CLOSEOUT: hit-tested against the enlarged
+            // SETTINGS_HIT_* rect, not the small SETTINGS_BTN_* visual -
+            // checked FIRST, same order as before, so it still wins over
+            // the MKH row split below for every pixel inside it.
+            bool inSettingsBtn = touchX >= SETTINGS_HIT_X && touchX < SETTINGS_HIT_X + SETTINGS_HIT_W &&
+                                  touchY >= SETTINGS_HIT_Y && touchY < SETTINGS_HIT_Y + SETTINGS_HIT_H;
             if (inSettingsBtn) {
                 Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings button -> PAGE_EDIT_SELECT\n", touchX,
                                 touchY);
                 // WO10 Step 1: every fresh entry from the dashboard
                 // starts the editing context clean - see EditContext's
                 // doc comment for the other clearing path (Back from
-                // port select).
-                clearEditContext();
+                // port select). WO10-FINAL: now a full session clear
+                // (also wipes any pending edits/Test state left over
+                // from a prior visit that exited via DISCARD).
+                clearEditorSession();
                 goToPage(PAGE_EDIT_SELECT);
             } else {
                 // v0.9.0 Step 1 (PM feedback pass): hit-test any fresh tap to
@@ -1714,6 +2477,14 @@ void loop() {
                             "MK1 Touch: tap display=(x=%d,y=%d) -> MKH row device=%d, toggle OFF requested\n",
                             touchX, touchY, deviceId);
                         mkh_broadcast_toggle_off(deviceId);
+                        // WO10-FINAL rev B: "failsafe absolute... same
+                        // on dashboard hub toggle-OFF" - the neutral
+                        // command mkh_broadcast_toggle_off() already
+                        // issues (mkh_broadcast.c, untouched) covers
+                        // this device's latched-on ports' live output;
+                        // this clears our own latch tracking so a later
+                        // toggle ON doesn't resume already-latched.
+                        clearLatchStateForDevice(deviceId);
                         // Commanded-state semantics (WO9 PM decision): animate
                         // immediately on tap acceptance, not on completion. The
                         // neutral-then-drop sequence keeps running underneath,
@@ -1761,9 +2532,14 @@ void loop() {
             // (Back is prompt-gated, unlike the generic pattern's
             // unconditional navigation) - see dispatchCaptureTouch().
             dispatchCaptureTouch(touchX, touchY);
-        } else {
-            // SETTINGS only now - still the generic placeholder pattern.
-            dispatchEditorTouch(touchX, touchY);
+        } else if (currentPage == PAGE_EDIT_SETTINGS) {
+            // WO10-FINAL: settings is real now too - dispatchEditorTouch()/
+            // drawEditorPlaceholder()/editorBackTarget()/editorNextTarget()/
+            // pageHasNext() have no remaining caller as of this order
+            // (left in place, flagged as dead code in the completion
+            // report, rather than risk touching already-verified Step 0-2
+            // code under this order's single-pass scope).
+            dispatchSettingsTouch(touchX, touchY);
         }
     }
 

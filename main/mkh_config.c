@@ -16,21 +16,66 @@
 
 // Table-driven input tokens: add a new row (and enum value in
 // mkh_config.h) to support a new input source. Nothing else in the
-// parser needs to change.
+// parser needs to change. WO10-FINAL rev B: full XWC input universe -
+// token strings reported verbatim in the completion report.
 typedef struct {
     const char* name;
     mkh_input_source_t value;
 } mkh_input_token_t;
 
 static const mkh_input_token_t kInputTokens[] = {
-    {"LSNS", MKH_INPUT_LSNS},
-    {"RSNS", MKH_INPUT_RSNS},
+    {"LSNS", MKH_INPUT_LSNS}, {"LSEW", MKH_INPUT_LSEW}, {"RSNS", MKH_INPUT_RSNS}, {"RSEW", MKH_INPUT_RSEW},
+    {"LT", MKH_INPUT_LT},     {"RT", MKH_INPUT_RT},     {"A", MKH_INPUT_BTN_A},   {"B", MKH_INPUT_BTN_B},
+    {"X", MKH_INPUT_BTN_X},   {"Y", MKH_INPUT_BTN_Y},   {"LB", MKH_INPUT_LB},     {"RB", MKH_INPUT_RB},
+    {"DUP", MKH_INPUT_DPAD_UP},   {"DDN", MKH_INPUT_DPAD_DOWN},
+    {"DLT", MKH_INPUT_DPAD_LEFT}, {"DRT", MKH_INPUT_DPAD_RIGHT},
+    {"L3", MKH_INPUT_L3},     {"R3", MKH_INPUT_R3},
 };
 #define NUM_INPUT_TOKENS (sizeof(kInputTokens) / sizeof(kInputTokens[0]))
+
+// Table-driven mode tokens, same pattern.
+typedef struct {
+    const char* name;
+    mkh_input_mode_t value;
+} mkh_mode_token_t;
+
+static const mkh_mode_token_t kModeTokens[] = {
+    {"proportional", MKH_MODE_PROPORTIONAL},
+    {"momentary", MKH_MODE_MOMENTARY},
+    {"latched", MKH_MODE_LATCHED},
+};
+#define NUM_MODE_TOKENS (sizeof(kModeTokens) / sizeof(kModeTokens[0]))
 
 static mkh_port_config_t s_table[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS];
 static bool s_source_is_file = false;
 static int s_skipped_lines = 0;
+
+mkh_input_class_t mkh_config_input_class(mkh_input_source_t input) {
+    switch (input) {
+        case MKH_INPUT_LSNS:
+        case MKH_INPUT_LSEW:
+        case MKH_INPUT_RSNS:
+        case MKH_INPUT_RSEW:
+            return MKH_INPUT_CLASS_AXIS;
+        case MKH_INPUT_LT:
+        case MKH_INPUT_RT:
+            return MKH_INPUT_CLASS_TRIGGER;
+        default:
+            return MKH_INPUT_CLASS_DIGITAL;
+    }
+}
+
+// Default mode when a line's mode= attribute is absent - order: "buttons/
+// dpad/stick-clicks = momentary (default) | latched. Triggers =
+// proportional (default) | momentary | latched." Axis default is
+// PROPORTIONAL too, though it's never actually consulted at drive time
+// (see processMappedInputs() in sketch.cpp) - stored for consistency
+// only, per mkh_input_mode_t's own doc comment.
+static mkh_input_mode_t default_mode_for_input(mkh_input_source_t input) {
+    if (mkh_config_input_class(input) == MKH_INPUT_CLASS_DIGITAL)
+        return MKH_MODE_MOMENTARY;
+    return MKH_MODE_PROPORTIONAL;
+}
 
 void mkh_config_set_defaults(void) {
     for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++) {
@@ -38,6 +83,7 @@ void mkh_config_set_defaults(void) {
             s_table[d][p].input = MKH_INPUT_NONE;
             s_table[d][p].invert = false;
             s_table[d][p].max_percent = 100;
+            s_table[d][p].mode = MKH_MODE_PROPORTIONAL;
             s_table[d][p].from_file = false;
         }
     }
@@ -68,12 +114,64 @@ const mkh_port_config_t* mkh_config_get(int device_id, int port) {
     return &s_table[device_id][port];
 }
 
+void mkh_config_set_port(int device_id, int port, mkh_input_source_t input, bool invert, uint8_t max_percent,
+                          mkh_input_mode_t mode) {
+    if (device_id < 0 || device_id >= MKH_MK6_NUM_DEVICES)
+        return;
+    if (port < 0 || port >= MKH_MK6_NUM_CHANNELS)
+        return;
+    s_table[device_id][port].input = input;
+    s_table[device_id][port].invert = invert;
+    s_table[device_id][port].max_percent = max_percent;
+    s_table[device_id][port].mode = mode;
+    s_table[device_id][port].from_file = true;
+}
+
 static const char* input_token_name(mkh_input_source_t input) {
     for (size_t i = 0; i < NUM_INPUT_TOKENS; i++) {
         if (kInputTokens[i].value == input)
             return kInputTokens[i].name;
     }
     return "none";
+}
+
+const char* mkh_config_input_token_name(mkh_input_source_t input) {
+    return input_token_name(input);
+}
+
+static const char* mode_token_name(mkh_input_mode_t mode) {
+    for (size_t i = 0; i < NUM_MODE_TOKENS; i++) {
+        if (kModeTokens[i].value == mode)
+            return kModeTokens[i].name;
+    }
+    return "proportional";
+}
+
+int mkh_config_serialize(char* buf, size_t buf_size) {
+    size_t used = 0;
+    for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++) {
+        for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++) {
+            const mkh_port_config_t* c = &s_table[d][p];
+            if (c->input == MKH_INPUT_NONE)
+                continue;
+            int n;
+            if (mkh_config_input_class(c->input) == MKH_INPUT_CLASS_AXIS) {
+                // mode= omitted - meaningless for an axis (mkh_input_mode_t).
+                n = snprintf(buf + used, buf_size - used, "HUB%d_PORT_%c = %s invert=%s max=%u curve=linear\n",
+                             mkh_device_app_number(d), mkh_port_letter(p), input_token_name(c->input),
+                             c->invert ? "yes" : "no", (unsigned)c->max_percent);
+            } else {
+                n = snprintf(buf + used, buf_size - used,
+                             "HUB%d_PORT_%c = %s invert=%s max=%u curve=linear mode=%s\n", mkh_device_app_number(d),
+                             mkh_port_letter(p), input_token_name(c->input), c->invert ? "yes" : "no",
+                             (unsigned)c->max_percent, mode_token_name(c->mode));
+            }
+            if (n < 0 || (size_t)n >= buf_size - used)
+                return -1;
+            used += (size_t)n;
+        }
+    }
+    return (int)used;
 }
 
 static const char* skip_spaces(const char* s) {
@@ -169,6 +267,8 @@ void mkh_config_parse_line(const char* raw_line) {
 
     bool invert = false;
     uint8_t max_percent = 100;
+    mkh_input_mode_t mode = default_mode_for_input(input);
+    bool mode_explicit = false;
 
     while ((tok = strtok_r(NULL, " \t", &saveptr)) != NULL) {
         char* attr_eq = strchr(tok, '=');
@@ -210,16 +310,41 @@ void mkh_config_parse_line(const char* raw_line) {
                 loge("MK1 Config: HUB%d_PORT_%c unsupported curve=\"%s\", treated as linear\n", hub_num, port_letter,
                      attr_val);
             }
+        } else if (strcasecmp(attr_key, "mode") == 0) {
+            // WO10-FINAL rev B. Accepted for any input token regardless
+            // of class (kept simple/uniform, per mkh_input_mode_t's doc
+            // comment) - an axis port with an explicit mode= parses and
+            // stores it without complaint, it's just never consulted at
+            // drive time.
+            bool mode_found = false;
+            for (size_t i = 0; i < NUM_MODE_TOKENS; i++) {
+                if (strcasecmp(attr_val, kModeTokens[i].name) == 0) {
+                    mode = kModeTokens[i].value;
+                    mode_found = true;
+                    break;
+                }
+            }
+            if (!mode_found) {
+                loge(
+                    "MK1 Config: HUB%d_PORT_%c invalid mode=\"%s\" (want "
+                    "proportional/momentary/latched), line skipped\n",
+                    hub_num, port_letter, attr_val);
+                s_skipped_lines++;
+                return;
+            }
+            mode_explicit = true;
         } else {
             loge("MK1 Config: HUB%d_PORT_%c unknown key \"%s\", line skipped\n", hub_num, port_letter, attr_key);
             s_skipped_lines++;
             return;
         }
     }
+    (void)mode_explicit;  // mode already defaulted above if this stayed false
 
     s_table[device_id][port].input = input;
     s_table[device_id][port].invert = invert;
     s_table[device_id][port].max_percent = max_percent;
+    s_table[device_id][port].mode = mode;
     s_table[device_id][port].from_file = true;
 }
 
@@ -228,9 +353,9 @@ void mkh_config_log_table(void) {
     for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++) {
         for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++) {
             const mkh_port_config_t* c = &s_table[d][p];
-            logi("MK1 Config:   HUB%d_PORT_%c = %s invert=%s max=%u curve=linear (source=%s)\n",
+            logi("MK1 Config:   HUB%d_PORT_%c = %s invert=%s max=%u curve=linear mode=%s (source=%s)\n",
                  mkh_device_app_number(d), mkh_port_letter(p), input_token_name(c->input), c->invert ? "yes" : "no",
-                 (unsigned)c->max_percent, c->from_file ? "file" : "default");
+                 (unsigned)c->max_percent, mode_token_name(c->mode), c->from_file ? "file" : "default");
         }
     }
 }
