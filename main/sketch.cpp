@@ -224,10 +224,11 @@ static void initDisplay() {
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
 //
-// MK6 stick mapping: XWC left stick Y -> device 0 port A (v0.6.0 Step 2).
-// v0.7.0 Step 2 adds right stick Y -> device 1 port A, same deadzone,
-// same linear map, same sign convention (mkStickYToChannelByte is generic
-// over any axisY()/axisRY()-shaped reading, so it's reused as-is).
+// MK6 stick mapping (v0.8.0 Step 2): XWC left stick Y = MKH_INPUT_LSNS,
+// right stick Y = MKH_INPUT_RSNS. Which device/port each drives is no
+// longer hardcoded here - it's resolved at runtime from the config
+// table (mkh_config_get(), populated by mkh_storage_boot_read() at
+// boot; see processGamepad() below and mkh_config.h).
 //
 // Bluepad32's axisY()/axisRY() range is approximately -511 (full up) ..
 // 512 (full down), 0 = center - verified against Bluepad32's own
@@ -240,10 +241,6 @@ ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 // obvious place it lives.
 #define MKH_STICK_AXIS_MAGNITUDE 512
 #define MKH_STICK_DEADZONE_PERCENT 8
-
-// Which MK6 device slot each XWC stick drives.
-#define MKH_XWC_LEFT_STICK_DEVICE 0
-#define MKH_XWC_RIGHT_STICK_DEVICE 1
 
 // Maps a raw axisY()/axisRY() reading to a MK6 telegram byte (0x00..0xFF,
 // 0x80 = neutral). Continuous across the deadzone boundary (no output
@@ -267,6 +264,36 @@ static uint8_t mkStickYToChannelByte(int32_t axisY) {
     // each direction separately so the extremes land exactly on 0xFF/0x00.
     float scale = forward ? 127.0f : 128.0f;
     int value = 128 + (int)lroundf((forward ? 1.0f : -1.0f) * fraction * scale);
+    if (value > 0xFF)
+        value = 0xFF;
+    if (value < 0x00)
+        value = 0x00;
+    return (uint8_t)value;
+}
+
+// Applies a config port's invert/max attributes to a raw MK6 channel
+// byte (0x00..0xFF, 0x80=neutral). curve is always linear in v1 (see
+// mkh_config.h), so there's no curve step here.
+//
+// invert mirrors the byte around neutral (0x80). The protocol's byte
+// encoding has an inherent 127-wide forward span (0x80..0xFF) vs
+// 128-wide reverse span (0x80..0x00) - see mkStickYToChannelByte above -
+// so a byte-perfect mirror is impossible at the single extreme value
+// 0xFF (mirrors to 0x01, not 0x00); the clamp below is that one-unit
+// edge case, not a bug.
+static uint8_t mkApplyPortConfig(uint8_t rawByte, const mkh_port_config_t* cfg) {
+    int value = rawByte;
+    if (cfg->invert) {
+        value = 0x100 - value;
+        if (value > 0xFF)
+            value = 0xFF;
+        if (value < 0x00)
+            value = 0x00;
+    }
+
+    int delta = value - 0x80;
+    delta = (delta * (int)cfg->max_percent) / 100;
+    value = 0x80 + delta;
     if (value > 0xFF)
         value = 0xFF;
     if (value < 0x00)
@@ -312,13 +339,18 @@ void onDisconnectedController(ControllerPtr ctl) {
                 // Dashboard: XWC gone.
                 xwcState = XWC_DISCONNECTED;
 
-                // Failsafe: force every channel neutral on both devices
-                // the XWC drives, so neither hub keeps coasting on the
-                // last value it heard.
-                const int xwcDevices[] = {MKH_XWC_LEFT_STICK_DEVICE, MKH_XWC_RIGHT_STICK_DEVICE};
-                for (int dev : xwcDevices) {
-                    for (int ch = 0; ch < MKH_MK6_NUM_CHANNELS; ch++) {
-                        mkh_set_channel(dev, ch, 0x80);
+                // Failsafe (v0.8.0 Step 2): force every channel the
+                // config table assigns to an XWC input source back to
+                // neutral, so no hub keeps coasting on the last value it
+                // heard. Table-driven, not hardcoded device indices, so
+                // it stays correct regardless of which hub/port the
+                // config maps LSNS/RSNS onto.
+                for (int dev = 0; dev < MKH_MK6_NUM_DEVICES; dev++) {
+                    for (int port = 0; port < MKH_MK6_NUM_CHANNELS; port++) {
+                        const mkh_port_config_t* cfg = mkh_config_get(dev, port);
+                        if (cfg && cfg->input != MKH_INPUT_NONE) {
+                            mkh_set_channel(dev, port, 0x80);
+                        }
                     }
                 }
             }
@@ -417,13 +449,26 @@ void dumpBalanceBoard(ControllerPtr ctl) {
 
 void processGamepad(ControllerPtr ctl) {
     if (ctl->index() == 0) {
-        // XWC left stick Y -> device 0 port A; right stick Y -> device 1
-        // port A (see mkStickYToChannelByte).
-        uint8_t leftChannelByte = mkStickYToChannelByte(ctl->axisY());
-        mkh_set_channel(MKH_XWC_LEFT_STICK_DEVICE, MKH_PORT_A, leftChannelByte);
+        // v0.8.0 Step 2: left stick Y = MKH_INPUT_LSNS, right stick Y =
+        // MKH_INPUT_RSNS, applied to whichever device/port slot(s) the
+        // config table currently assigns each input source to - see
+        // mkh_config.h. Default config reproduces v0.7.0 exactly (HUB1
+        // port A = LSNS, HUB2 port A = RSNS, invert=no, max=100).
+        uint8_t leftRawByte = mkStickYToChannelByte(ctl->axisY());
+        uint8_t rightRawByte = mkStickYToChannelByte(ctl->axisRY());
 
-        uint8_t rightChannelByte = mkStickYToChannelByte(ctl->axisRY());
-        mkh_set_channel(MKH_XWC_RIGHT_STICK_DEVICE, MKH_PORT_A, rightChannelByte);
+        for (int dev = 0; dev < MKH_MK6_NUM_DEVICES; dev++) {
+            for (int port = 0; port < MKH_MK6_NUM_CHANNELS; port++) {
+                const mkh_port_config_t* cfg = mkh_config_get(dev, port);
+                if (!cfg)
+                    continue;
+                if (cfg->input == MKH_INPUT_LSNS) {
+                    mkh_set_channel(dev, port, mkApplyPortConfig(leftRawByte, cfg));
+                } else if (cfg->input == MKH_INPUT_RSNS) {
+                    mkh_set_channel(dev, port, mkApplyPortConfig(rightRawByte, cfg));
+                }
+            }
+        }
     }
 
     // There are different ways to query whether a button is pressed.
