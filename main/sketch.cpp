@@ -109,16 +109,53 @@ static uint32_t lastUptimeDrawnSec = 0xFFFFFFFF;
 // enum, and boot now starts on PAGE_SPLASH instead of landing directly
 // on PAGE_DASHBOARD - see setup() below. There is no path back to
 // PAGE_SPLASH/PAGE_STATS once left (not in WO11 scope).
+//
+// WO10 Step 1: PAGE_EDIT_SELECT is repurposed from "generic corridor
+// placeholder" to hub select (custom render/dispatch - see
+// drawHubSelect()/dispatchHubSelectTouch() below); PAGE_EDIT_PORTS is
+// new (port select - drawPortSelect()/dispatchPortSelectTouch()).
+// PAGE_EDIT_CAPTURE/PAGE_EDIT_SETTINGS keep the WO10 Step 0 generic
+// placeholder mechanism (drawEditorPlaceholder()/dispatchEditorTouch()),
+// unchanged except CAPTURE's title now renders the editing context's
+// selection instead of a static string.
 enum UiPage {
     PAGE_SPLASH = 0,
     PAGE_STATS,
     PAGE_DASHBOARD,
     PAGE_EDIT_SELECT,
+    PAGE_EDIT_PORTS,
     PAGE_EDIT_CAPTURE,
     PAGE_EDIT_SETTINGS,
     PAGE_COUNT
 };
 static UiPage currentPage = PAGE_SPLASH;
+
+// WO10 Step 1: editing context - selection state only (no pending
+// values yet - that's a later step). selected_valid is the "nothing
+// selected" sentinel: false until a port tap on PAGE_EDIT_PORTS
+// completes a full hub+port selection. Cleared on every fresh editor
+// entry from the dashboard (see the settings-button tap handler in
+// loop()) and on Back from port select to hub select (see
+// dispatchPortSelectTouch() - CC's choice: Back clears rather than
+// persists, so hub select is always a clean slate on (re-)entry, never
+// partially-stale).
+struct EditContext {
+    int selected_device;  // protocol device slot 0..2, meaningful only once selected_valid or mid-selection
+    int selected_port;    // channel index 0..5 (MKH_PORT_A..F), meaningful only once selected_valid
+    bool selected_valid;  // true only once BOTH device and port are confirmed
+};
+static EditContext editCtx = {-1, -1, false};
+
+static void clearEditContext() {
+    editCtx.selected_device = -1;
+    editCtx.selected_port = -1;
+    editCtx.selected_valid = false;
+}
+
+// Forward-declared so the hub/port select dispatch functions (defined
+// before goToPage() itself, further down) can call it - goToPage()'s
+// own definition and doc comment are unchanged, just declared early.
+static void goToPage(UiPage page);
 
 static int16_t rowTop(int idx) {
     return ROW_START_Y + idx * (ROW_H + ROW_GAP);
@@ -372,10 +409,13 @@ static void updateDashboard() {
     drawUptime(false);
 }
 
-// WO10 Step 0: editor page placeholders. Page name + Back (+ Next, on
-// SELECT/CAPTURE only) - no editor logic, no config reads/writes. These
-// are replaced wholesale by later WO10 steps; they exist only to prove
-// the page-navigation corridor end-to-end.
+// WO10 Step 0: editor page placeholders - CAPTURE and SETTINGS only as
+// of WO10 Step 1 (SELECT was replaced by the custom hub-select page
+// below; PORTS is new and never used this generic pattern). Page name +
+// Back (+ Next, CAPTURE only) - no editor logic, no config reads/writes
+// beyond CAPTURE's now-context-aware title. These are replaced wholesale
+// by later WO10 steps; they exist only to prove the page-navigation
+// corridor end-to-end.
 static const int16_t EDITOR_BTN_Y = 190;
 static const int16_t EDITOR_BTN_H = 40;
 static const int16_t EDITOR_BACK_X = 10;
@@ -383,18 +423,32 @@ static const int16_t EDITOR_BACK_W = 140;
 static const int16_t EDITOR_NEXT_X = 170;
 static const int16_t EDITOR_NEXT_W = 140;
 
-static void drawEditorButton(int16_t x, int16_t w, const char* label) {
-    display->fillRoundRect(x, EDITOR_BTN_Y, w, EDITOR_BTN_H, 6, COLOR_CARD_BG);
-    display->drawRoundRect(x, EDITOR_BTN_Y, w, EDITOR_BTN_H, 6, COLOR_CARD_BORDER);
+// WO10 Step 1: generalized out of what used to be drawEditorButton()'s
+// whole body (hardcoded to EDITOR_BTN_Y/EDITOR_BTN_H) so the new hub/
+// port select pages' Back button - deliberately different geometry,
+// see SELECT_BACK_* below - can share the same drawing code instead of
+// a near-duplicate. drawEditorButton() is now a thin wrapper preserving
+// its exact prior behavior for CAPTURE/SETTINGS's Back/Next buttons.
+static void drawButtonAt(int16_t x, int16_t y, int16_t w, int16_t h, const char* label) {
+    display->fillRoundRect(x, y, w, h, 6, COLOR_CARD_BG);
+    display->drawRoundRect(x, y, w, h, 6, COLOR_CARD_BORDER);
     display->setTextColor(COLOR_LABEL);
     display->setTextSize(2);
     int16_t tx = x + (w - textWidth(label, 2)) / 2;
-    display->setCursor(tx, EDITOR_BTN_Y + (EDITOR_BTN_H - 16) / 2);
+    display->setCursor(tx, y + (h - 16) / 2);
     display->print(label);
 }
 
+static void drawEditorButton(int16_t x, int16_t w, const char* label) {
+    drawButtonAt(x, EDITOR_BTN_Y, w, EDITOR_BTN_H, label);
+}
+
+// WO10 Step 1: PAGE_EDIT_SELECT no longer uses this generic
+// placeholder/dispatch pair at all (see drawHubSelect()/
+// dispatchHubSelectTouch() below) - only PAGE_EDIT_CAPTURE still has a
+// Next button (-> PAGE_EDIT_SETTINGS).
 static bool pageHasNext(UiPage page) {
-    return page == PAGE_EDIT_SELECT || page == PAGE_EDIT_CAPTURE;
+    return page == PAGE_EDIT_CAPTURE;
 }
 
 static void drawEditorPlaceholder(const char* pageName, UiPage page) {
@@ -531,6 +585,211 @@ static void updateStatsUptime() {
     drawStatsLine(STATS_LINE_UPTIME, line);
 }
 
+// WO10 Step 1: hub select + port select. Both have custom geometry (not
+// the generic EDITOR_BACK_*/EDITOR_BTN_Y placeholder pattern) because
+// this order's edge-margin requirement (~20px minimum, calibration is
+// center-weighted) is stricter than what EDITOR_BTN_Y's existing bottom
+// margin gives (230 bottom, only 10px from the 240px screen edge) - so
+// a new, separate Back button geometry is used here instead of reusing
+// EDITOR_BACK_X/W/EDITOR_BTN_Y/H, even though it's visually similar.
+static const int16_t SELECT_BACK_X = 90;
+static const int16_t SELECT_BACK_W = 140;
+static const int16_t SELECT_BACK_Y = 180;
+static const int16_t SELECT_BACK_H = 40;  // bottom=220, 20px from screen edge (240)
+
+// Mirrors mkh_broadcast.c's MKH_TIME_SLICE_NUM_DEVICES (2) - the third
+// hub (device 2 / MKH3) is structurally parked project-wide (see
+// mkh_broadcast_toggle_on()'s own device_id >= MKH_TIME_SLICE_NUM_
+// DEVICES guard). Restated here, not derived, since that constant is
+// private to a file this step must not change - same approach as
+// WO11's MK1_TELEGRAM_RATE_LABEL.
+static const int MKH_EDIT_MAX_ACTIVE_DEVICE = 2;  // device_id >= this is parked, not editable
+
+static const int16_t HUB_BTN_X = 20;
+static const int16_t HUB_BTN_W = 280;                 // right edge 300, 20px from screen edge (320)
+static const int16_t HUB_BTN_Y0 = 30;                  // top edge 30, 30px from screen edge (0)
+static const int16_t HUB_BTN_H = 40;                   // short dimension - exactly the 40px minimum
+static const int16_t HUB_BTN_GAP = 10;
+
+static int16_t hubBtnY(int idx) {
+    return HUB_BTN_Y0 + idx * (HUB_BTN_H + HUB_BTN_GAP);
+}
+
+static void drawHubButton(int deviceIdx) {
+    int16_t y = hubBtnY(deviceIdx);
+    bool parked = deviceIdx >= MKH_EDIT_MAX_ACTIVE_DEVICE;
+    uint16_t borderColor = parked ? COLOR_RED : COLOR_CARD_BORDER;
+
+    display->fillRoundRect(HUB_BTN_X, y, HUB_BTN_W, HUB_BTN_H, 6, COLOR_CARD_BG);
+    display->drawRoundRect(HUB_BTN_X, y, HUB_BTN_W, HUB_BTN_H, 6, borderColor);
+
+    char label[16];
+    snprintf(label, sizeof(label), "MKH%d", mkh_device_app_number(deviceIdx));
+    display->setTextColor(parked ? COLOR_CARD_BORDER : COLOR_LABEL);
+    display->setTextSize(2);
+    display->setCursor(HUB_BTN_X + 16, y + (HUB_BTN_H - 16) / 2);
+    display->print(label);
+
+    if (parked) {
+        const char* tag = "PARKED";
+        display->setTextColor(COLOR_CARD_BORDER);
+        display->setTextSize(1);
+        int16_t tx = HUB_BTN_X + HUB_BTN_W - 16 - textWidth(tag, 1);
+        display->setCursor(tx, y + (HUB_BTN_H - 8) / 2);
+        display->print(tag);
+    }
+}
+
+static void drawHubSelect() {
+    display->fillScreen(COLOR_BG);
+
+    const char* title = "SELECT HUB";
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(2);
+    display->setCursor((SCR_W - textWidth(title, 2)) / 2, 6);
+    display->print(title);
+
+    for (int i = 0; i < 3; i++) {
+        drawHubButton(i);
+    }
+
+    drawButtonAt(SELECT_BACK_X, SELECT_BACK_Y, SELECT_BACK_W, SELECT_BACK_H, "< BACK");
+}
+
+// Hub select's own hit zones - separate from dispatchEditorTouch()
+// (never consulted on the same tap) and from the dashboard's
+// touchYToDeviceId() split (different page, different geometry
+// entirely - this is not a reuse of that logic).
+static void dispatchHubSelectTouch(int16_t touchX, int16_t touchY) {
+    bool inBack = touchX >= SELECT_BACK_X && touchX < SELECT_BACK_X + SELECT_BACK_W && touchY >= SELECT_BACK_Y &&
+                  touchY < SELECT_BACK_Y + SELECT_BACK_H;
+    if (inBack) {
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> hub select BACK -> dashboard\n", touchX, touchY);
+        clearEditContext();
+        goToPage(PAGE_DASHBOARD);
+        return;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        int16_t y = hubBtnY(i);
+        bool inHub = touchX >= HUB_BTN_X && touchX < HUB_BTN_X + HUB_BTN_W && touchY >= y && touchY < y + HUB_BTN_H;
+        if (!inHub)
+            continue;
+
+        if (i >= MKH_EDIT_MAX_ACTIVE_DEVICE) {
+            // Same "stays parked" response pattern as the dashboard's
+            // toggle_on() guard, but this is selection-only - no
+            // broadcast function is called, nothing airs differently.
+            Console.printf(
+                "MK1 Touch: tap display=(x=%d,y=%d) -> hub select MKH%d, ignored - third hub stays parked (not "
+                "editable)\n",
+                touchX, touchY, mkh_device_app_number(i));
+        } else {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> hub select MKH%d -> port select\n", touchX,
+                            touchY, mkh_device_app_number(i));
+            editCtx.selected_device = i;
+            editCtx.selected_port = -1;
+            editCtx.selected_valid = false;  // device only so far - not a full selection yet
+            goToPage(PAGE_EDIT_PORTS);
+        }
+        return;
+    }
+}
+
+static const int16_t PORT_GRID_X0 = 20;                 // left edge 20, 20px from screen edge (0)
+static const int16_t PORT_GRID_COL_W = 80;
+static const int16_t PORT_GRID_COL_GAP = 20;             // 3 cols: 20+80+20+80+20+80+20=320, right edge 300
+static const int16_t PORT_GRID_Y0 = 40;                  // top edge 40, 40px from screen edge (0)
+static const int16_t PORT_GRID_ROW_H = 50;                // short dimension of each cell - above the 40px minimum
+static const int16_t PORT_GRID_ROW_GAP = 20;
+
+static int16_t portCellX(int col) {
+    return PORT_GRID_X0 + col * (PORT_GRID_COL_W + PORT_GRID_COL_GAP);
+}
+static int16_t portCellY(int row) {
+    return PORT_GRID_Y0 + row * (PORT_GRID_ROW_H + PORT_GRID_ROW_GAP);
+}
+
+static void drawPortCell(int port) {
+    int col = port % 3;
+    int row = port / 3;
+    int16_t x = portCellX(col);
+    int16_t y = portCellY(row);
+
+    display->fillRoundRect(x, y, PORT_GRID_COL_W, PORT_GRID_ROW_H, 6, COLOR_CARD_BG);
+    display->drawRoundRect(x, y, PORT_GRID_COL_W, PORT_GRID_ROW_H, 6, COLOR_CARD_BORDER);
+
+    char label[2] = {mkh_port_letter(port), '\0'};
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(3);
+    int16_t tx = x + (PORT_GRID_COL_W - textWidth(label, 3)) / 2;
+    display->setCursor(tx, y + 8);
+    display->print(label);
+
+    // Optional per the order ("skip silently if not trivial" - this
+    // was): informational-only LSNS/RSNS tag for ports the mapping
+    // table already assigns. Read-only - no behavior difference, never
+    // written to.
+    const mkh_port_config_t* cfg = mkh_config_get(editCtx.selected_device, port);
+    if (cfg && cfg->input != MKH_INPUT_NONE) {
+        const char* tag = (cfg->input == MKH_INPUT_LSNS) ? "LSNS" : "RSNS";
+        display->setTextColor(COLOR_LABEL);
+        display->setTextSize(1);
+        int16_t tagX = x + (PORT_GRID_COL_W - textWidth(tag, 1)) / 2;
+        display->setCursor(tagX, y + PORT_GRID_ROW_H - 10);
+        display->print(tag);
+    }
+}
+
+static void drawPortSelect() {
+    display->fillScreen(COLOR_BG);
+
+    char header[32];
+    snprintf(header, sizeof(header), "MKH%d - pick a port", mkh_device_app_number(editCtx.selected_device));
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(2);
+    display->setCursor((SCR_W - textWidth(header, 2)) / 2, 8);
+    display->print(header);
+
+    for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++) {
+        drawPortCell(p);
+    }
+
+    drawButtonAt(SELECT_BACK_X, SELECT_BACK_Y, SELECT_BACK_W, SELECT_BACK_H, "< BACK");
+}
+
+// Port select's own hit zones - same separation rationale as
+// dispatchHubSelectTouch() above.
+static void dispatchPortSelectTouch(int16_t touchX, int16_t touchY) {
+    bool inBack = touchX >= SELECT_BACK_X && touchX < SELECT_BACK_X + SELECT_BACK_W && touchY >= SELECT_BACK_Y &&
+                  touchY < SELECT_BACK_Y + SELECT_BACK_H;
+    if (inBack) {
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> port select BACK -> hub select\n", touchX, touchY);
+        // WO10 Step 1 design choice (reported per the order): Back
+        // clears the full context rather than persisting the hub
+        // selection - hub select is always a clean slate on re-entry,
+        // never partially-stale.
+        clearEditContext();
+        goToPage(PAGE_EDIT_SELECT);
+        return;
+    }
+
+    for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++) {
+        int col = p % 3;
+        int row = p / 3;
+        int16_t x = portCellX(col);
+        int16_t y = portCellY(row);
+        if (touchX >= x && touchX < x + PORT_GRID_COL_W && touchY >= y && touchY < y + PORT_GRID_ROW_H) {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> port select MKH%d port %c -> capture\n", touchX,
+                            touchY, mkh_device_app_number(editCtx.selected_device), mkh_port_letter(p));
+            editCtx.selected_port = p;
+            editCtx.selected_valid = true;
+            goToPage(PAGE_EDIT_CAPTURE);
+            return;
+        }
+    }
+}
+
 // Sole navigation entry point (WO10 Step 0 design intent): every future
 // page type just needs an enum value, a render branch here, and a
 // dispatch branch in loop() - no other call site changes. Renders the
@@ -549,11 +808,27 @@ static void goToPage(UiPage page) {
             initDashboard();
             break;
         case PAGE_EDIT_SELECT:
-            drawEditorPlaceholder("EDIT: SELECT HUB", page);
+            drawHubSelect();
             break;
-        case PAGE_EDIT_CAPTURE:
-            drawEditorPlaceholder("EDIT: CAPTURE INPUT", page);
+        case PAGE_EDIT_PORTS:
+            drawPortSelect();
             break;
+        case PAGE_EDIT_CAPTURE: {
+            // WO10 Step 1: title now proves the editing context flows
+            // forward, instead of a static placeholder string. ASCII
+            // hyphen, not the order's example "·" middle-dot, since the
+            // display's built-in bitmap font isn't guaranteed to have a
+            // glyph for it.
+            char title[32];
+            if (editCtx.selected_valid) {
+                snprintf(title, sizeof(title), "MKH%d - Port %c", mkh_device_app_number(editCtx.selected_device),
+                         mkh_port_letter(editCtx.selected_port));
+            } else {
+                snprintf(title, sizeof(title), "EDIT: CAPTURE INPUT");
+            }
+            drawEditorPlaceholder(title, page);
+            break;
+        }
         case PAGE_EDIT_SETTINGS:
             drawEditorPlaceholder("EDIT: PORT SETTINGS", page);
             break;
@@ -562,12 +837,14 @@ static void goToPage(UiPage page) {
     }
 }
 
+// WO10 Step 1: PAGE_EDIT_SELECT no longer has a case here - it's never
+// passed in (dispatchHubSelectTouch() handles its own Back). CAPTURE's
+// Back target moved from PAGE_EDIT_SELECT to PAGE_EDIT_PORTS, since
+// PORTS is now the immediate predecessor in the corridor.
 static UiPage editorBackTarget(UiPage page) {
     switch (page) {
-        case PAGE_EDIT_SELECT:
-            return PAGE_DASHBOARD;
         case PAGE_EDIT_CAPTURE:
-            return PAGE_EDIT_SELECT;
+            return PAGE_EDIT_PORTS;
         case PAGE_EDIT_SETTINGS:
             return PAGE_EDIT_CAPTURE;
         default:
@@ -577,8 +854,6 @@ static UiPage editorBackTarget(UiPage page) {
 
 static UiPage editorNextTarget(UiPage page) {
     switch (page) {
-        case PAGE_EDIT_SELECT:
-            return PAGE_EDIT_CAPTURE;
         case PAGE_EDIT_CAPTURE:
             return PAGE_EDIT_SETTINGS;
         default:
@@ -1139,6 +1414,10 @@ void loop() {
     //
     // WO11: two more currentPage branches - PAGE_STATS (tap anywhere ->
     // dashboard) and PAGE_SPLASH (no interaction, boot-driven only).
+    //
+    // WO10 Step 1: PAGE_EDIT_SELECT/PAGE_EDIT_PORTS get their own custom
+    // dispatch functions now (not dispatchEditorTouch() - that's CAPTURE/
+    // SETTINGS only).
     int16_t touchX, touchY;
     if (mkh_touch_poll(&touchX, &touchY)) {
         if (currentPage == PAGE_DASHBOARD) {
@@ -1147,6 +1426,11 @@ void loop() {
             if (inSettingsBtn) {
                 Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings button -> PAGE_EDIT_SELECT\n", touchX,
                                 touchY);
+                // WO10 Step 1: every fresh entry from the dashboard
+                // starts the editing context clean - see EditContext's
+                // doc comment for the other clearing path (Back from
+                // port select).
+                clearEditContext();
                 goToPage(PAGE_EDIT_SELECT);
             } else {
                 // v0.9.0 Step 1 (PM feedback pass): hit-test any fresh tap to
@@ -1214,7 +1498,14 @@ void loop() {
         } else if (currentPage == PAGE_SPLASH) {
             // WO11: splash is boot-driven only (see setup()) - no tap
             // interaction, intentionally ignored.
+        } else if (currentPage == PAGE_EDIT_SELECT) {
+            // WO10 Step 1: hub select has its own custom hit zones, not
+            // the generic editor placeholder's - see dispatchHubSelectTouch().
+            dispatchHubSelectTouch(touchX, touchY);
+        } else if (currentPage == PAGE_EDIT_PORTS) {
+            dispatchPortSelectTouch(touchX, touchY);
         } else {
+            // CAPTURE, SETTINGS - still the generic placeholder pattern.
             dispatchEditorTouch(touchX, touchY);
         }
     }
