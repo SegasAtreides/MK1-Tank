@@ -139,17 +139,30 @@ static UiPage currentPage = PAGE_SPLASH;
 // dispatchPortSelectTouch() - CC's choice: Back clears rather than
 // persists, so hub select is always a clean slate on (re-)entry, never
 // partially-stale).
+//
+// WO10 Step 2: capture_input/capture_valid added. capture_valid tracks
+// its own "nothing captured" sentinel, independent of selected_valid -
+// selected_valid's meaning (device+port confirmed) is unchanged. Final
+// context invariant (resolved per the order - Step 1's port-select Back
+// already matched what Step 2 needs, no reconciliation required): Back
+// from port select clears the FULL context (device+port+capture); Back
+// from the capture page never clears device/port - only DISCARD (from
+// the leave-page prompt) clears capture, KEEP clears nothing.
 struct EditContext {
-    int selected_device;  // protocol device slot 0..2, meaningful only once selected_valid or mid-selection
-    int selected_port;    // channel index 0..5 (MKH_PORT_A..F), meaningful only once selected_valid
-    bool selected_valid;  // true only once BOTH device and port are confirmed
+    int selected_device;                // protocol device slot 0..2, meaningful only once selected_valid or mid-selection
+    int selected_port;                  // channel index 0..5 (MKH_PORT_A..F), meaningful only once selected_valid
+    bool selected_valid;                // true only once BOTH device and port are confirmed
+    mkh_input_source_t captured_input;  // meaningful only once capture_valid
+    bool capture_valid;                 // "nothing captured yet" sentinel, tracked separately from selected_valid
 };
-static EditContext editCtx = {-1, -1, false};
+static EditContext editCtx = {-1, -1, false, MKH_INPUT_NONE, false};
 
 static void clearEditContext() {
     editCtx.selected_device = -1;
     editCtx.selected_port = -1;
     editCtx.selected_valid = false;
+    editCtx.captured_input = MKH_INPUT_NONE;
+    editCtx.capture_valid = false;
 }
 
 // Forward-declared so the hub/port select dispatch functions (defined
@@ -409,13 +422,12 @@ static void updateDashboard() {
     drawUptime(false);
 }
 
-// WO10 Step 0: editor page placeholders - CAPTURE and SETTINGS only as
-// of WO10 Step 1 (SELECT was replaced by the custom hub-select page
-// below; PORTS is new and never used this generic pattern). Page name +
-// Back (+ Next, CAPTURE only) - no editor logic, no config reads/writes
-// beyond CAPTURE's now-context-aware title. These are replaced wholesale
-// by later WO10 steps; they exist only to prove the page-navigation
-// corridor end-to-end.
+// WO10 Step 0: editor page placeholder - PAGE_EDIT_SETTINGS only as of
+// WO10 Step 2 (SELECT was replaced by hub select in Step 1, PORTS never
+// used this pattern, CAPTURE was replaced by the real capture page in
+// Step 2 - see drawCapturePage()/dispatchCaptureTouch() above). Page
+// name + Back only now (no Next - see pageHasNext() below). Still
+// replaced wholesale when Settings gets built for real.
 static const int16_t EDITOR_BTN_Y = 190;
 static const int16_t EDITOR_BTN_H = 40;
 static const int16_t EDITOR_BACK_X = 10;
@@ -428,7 +440,8 @@ static const int16_t EDITOR_NEXT_W = 140;
 // port select pages' Back button - deliberately different geometry,
 // see SELECT_BACK_* below - can share the same drawing code instead of
 // a near-duplicate. drawEditorButton() is now a thin wrapper preserving
-// its exact prior behavior for CAPTURE/SETTINGS's Back/Next buttons.
+// its exact prior behavior for PAGE_EDIT_SETTINGS's Back button (its
+// only remaining caller as of WO10 Step 2).
 static void drawButtonAt(int16_t x, int16_t y, int16_t w, int16_t h, const char* label) {
     display->fillRoundRect(x, y, w, h, 6, COLOR_CARD_BG);
     display->drawRoundRect(x, y, w, h, 6, COLOR_CARD_BORDER);
@@ -445,10 +458,13 @@ static void drawEditorButton(int16_t x, int16_t w, const char* label) {
 
 // WO10 Step 1: PAGE_EDIT_SELECT no longer uses this generic
 // placeholder/dispatch pair at all (see drawHubSelect()/
-// dispatchHubSelectTouch() below) - only PAGE_EDIT_CAPTURE still has a
-// Next button (-> PAGE_EDIT_SETTINGS).
+// dispatchHubSelectTouch() below).
+// WO10 Step 2: PAGE_EDIT_CAPTURE moved off this generic pattern too
+// (see dispatchCaptureTouch()/captureHasNext() instead) - no page on
+// the remaining generic corridor (PAGE_EDIT_SETTINGS only) has a Next.
 static bool pageHasNext(UiPage page) {
-    return page == PAGE_EDIT_CAPTURE;
+    (void)page;
+    return false;
 }
 
 static void drawEditorPlaceholder(const char* pageName, UiPage page) {
@@ -782,11 +798,178 @@ static void dispatchPortSelectTouch(int16_t touchX, int16_t touchY) {
         if (touchX >= x && touchX < x + PORT_GRID_COL_W && touchY >= y && touchY < y + PORT_GRID_ROW_H) {
             Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> port select MKH%d port %c -> capture\n", touchX,
                             touchY, mkh_device_app_number(editCtx.selected_device), mkh_port_letter(p));
+            // WO10 Step 2: a capture is tied to the specific port being
+            // edited - re-tapping the SAME port (e.g. after KEEP
+            // returned here) walks back into capture with it intact;
+            // tapping a DIFFERENT port starts fresh, since the old
+            // capture belonged to the port being left behind.
+            bool samePort = editCtx.selected_valid && editCtx.selected_port == p;
+            if (!samePort) {
+                editCtx.captured_input = MKH_INPUT_NONE;
+                editCtx.capture_valid = false;
+            }
             editCtx.selected_port = p;
             editCtx.selected_valid = true;
             goToPage(PAGE_EDIT_CAPTURE);
             return;
         }
+    }
+}
+
+// WO10 Step 2: capture page. Replaces the PAGE_EDIT_CAPTURE placeholder
+// wholesale - custom render/dispatch, like hub/port select, not the
+// generic drawEditorPlaceholder()/dispatchEditorTouch() pattern (see
+// the removed PAGE_EDIT_CAPTURE cases in editorBackTarget()/
+// editorNextTarget()/pageHasNext() below).
+//
+// Mirrors mkh_config.c's kInputTokens strings (LSNS/RSNS) rather than
+// exposing input_token_name() (private to mkh_config.c) - same
+// restate-don't-touch-the-file approach as WO11's MK1_TELEGRAM_RATE_
+// LABEL and WO10 Step 1's MKH_EDIT_MAX_ACTIVE_DEVICE. mkh_config.c
+// currently defines NO button tokens at all (LSNS/RSNS only, both
+// stick axes) - there is nothing for a button press to be captured as
+// yet; see checkCapture() further down for where that shows up.
+static const char* mkhCaptureTokenLabel(mkh_input_source_t token) {
+    switch (token) {
+        case MKH_INPUT_LSNS:
+            return "LSNS";
+        case MKH_INPUT_RSNS:
+            return "RSNS";
+        default:
+            return "NONE";
+    }
+}
+
+// Rebuilt-page geometry (order: "the old 10px-margin placeholder
+// buttons die here") - same >=40px short dimension / >=20px edge margin
+// rules as WO10 Step 1's hub/port select, not a reuse of EDITOR_BACK_X/
+// EDITOR_BTN_Y (still 10px bottom margin, still used by the
+// PAGE_EDIT_SETTINGS placeholder, out of this step's scope). Two
+// buttons side by side (Back + Next, or Keep + Discard while the leave-
+// page prompt is up - same rects, different labels/meaning).
+static const int16_t CAPTURE_BTN_Y = 180;
+static const int16_t CAPTURE_BTN_H = 40;                 // short dimension - exactly the 40px minimum
+static const int16_t CAPTURE_LEFT_X = 20;                 // left edge 20, 20px from screen edge (0)
+static const int16_t CAPTURE_LEFT_W = 120;
+static const int16_t CAPTURE_RIGHT_X = 180;
+static const int16_t CAPTURE_RIGHT_W = 120;               // right edge 300, 20px from screen edge (320)
+static const int16_t CAPTURE_STATUS_Y = 70;
+static const int16_t CAPTURE_STATUS_H = 34;
+static const int16_t CAPTURE_PROMPT_Y = 140;
+static const int16_t CAPTURE_PROMPT_H = 30;
+
+// WO10 Step 2: leave-page prompt as IN-PAGE STATE (not a new UiPage
+// enum value) - reported per the order's "splice lesson" ask. A new
+// PAGE_EDIT_PROMPT page would have needed a goToPage() branch, a
+// loop() dispatch branch, and entries in editorBackTarget()/
+// editorNextTarget()/pageHasNext() for something no OTHER page can
+// navigate into or back out of - it's a sub-state of this one page,
+// never a destination in its own right. A plain bool plus an overlay
+// redraw keeps every call site that would otherwise need touching
+// (goToPage()'s switch, loop()'s currentPage dispatch chain) exactly as
+// simple as hub/port select's, at the cost of this page's own dispatch
+// function needing an internal branch - contained entirely here.
+static bool capturePromptActive = false;
+
+static bool captureHasNext() {
+    return editCtx.capture_valid;
+}
+
+static void drawCaptureButtons() {
+    display->fillRect(0, CAPTURE_BTN_Y - 4, SCR_W, CAPTURE_BTN_H + 8, COLOR_BG);
+    drawButtonAt(CAPTURE_LEFT_X, CAPTURE_BTN_Y, CAPTURE_LEFT_W, CAPTURE_BTN_H, "< BACK");
+    if (captureHasNext()) {
+        drawButtonAt(CAPTURE_RIGHT_X, CAPTURE_BTN_Y, CAPTURE_RIGHT_W, CAPTURE_BTN_H, "NEXT >");
+    }
+}
+
+static void drawCaptureStatus() {
+    display->fillRect(0, CAPTURE_STATUS_Y, SCR_W, CAPTURE_STATUS_H, COLOR_BG);
+    display->setTextColor(COLOR_LABEL);
+    if (editCtx.capture_valid) {
+        char line[24];
+        snprintf(line, sizeof(line), "CAPTURED: %s", mkhCaptureTokenLabel(editCtx.captured_input));
+        display->setTextSize(3);
+        display->setCursor((SCR_W - textWidth(line, 3)) / 2, CAPTURE_STATUS_Y);
+        display->print(line);
+    } else {
+        const char* waiting = "WAITING FOR INPUT...";
+        display->setTextSize(2);
+        display->setCursor((SCR_W - textWidth(waiting, 2)) / 2, CAPTURE_STATUS_Y + 6);
+        display->print(waiting);
+    }
+}
+
+static void drawCapturePage(const char* title) {
+    display->fillScreen(COLOR_BG);
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(2);
+    display->setCursor((SCR_W - textWidth(title, 2)) / 2, 8);
+    display->print(title);
+
+    const char* instruction = "MOVE A STICK OR PRESS A BUTTON";
+    display->setTextSize(1);
+    display->setCursor((SCR_W - textWidth(instruction, 1)) / 2, 34);
+    display->print(instruction);
+
+    drawCaptureStatus();
+    drawCaptureButtons();
+}
+
+static void drawCapturePromptOverlay() {
+    const char* q = "KEEP CAPTURE?";
+    display->fillRect(0, CAPTURE_PROMPT_Y, SCR_W, CAPTURE_PROMPT_H, COLOR_BG);
+    display->setTextColor(COLOR_YELLOW);
+    display->setTextSize(2);
+    display->setCursor((SCR_W - textWidth(q, 2)) / 2, CAPTURE_PROMPT_Y + 6);
+    display->print(q);
+
+    display->fillRect(0, CAPTURE_BTN_Y - 4, SCR_W, CAPTURE_BTN_H + 8, COLOR_BG);
+    drawButtonAt(CAPTURE_LEFT_X, CAPTURE_BTN_Y, CAPTURE_LEFT_W, CAPTURE_BTN_H, "KEEP");
+    drawButtonAt(CAPTURE_RIGHT_X, CAPTURE_BTN_Y, CAPTURE_RIGHT_W, CAPTURE_BTN_H, "DISCARD");
+}
+
+// Capture page's own hit zones + the in-page prompt's, same separation
+// rationale as dispatchHubSelectTouch()/dispatchPortSelectTouch().
+static void dispatchCaptureTouch(int16_t touchX, int16_t touchY) {
+    bool inLeftBtn = touchX >= CAPTURE_LEFT_X && touchX < CAPTURE_LEFT_X + CAPTURE_LEFT_W && touchY >= CAPTURE_BTN_Y &&
+                     touchY < CAPTURE_BTN_Y + CAPTURE_BTN_H;
+    bool inRightBtn = touchX >= CAPTURE_RIGHT_X && touchX < CAPTURE_RIGHT_X + CAPTURE_RIGHT_W &&
+                      touchY >= CAPTURE_BTN_Y && touchY < CAPTURE_BTN_Y + CAPTURE_BTN_H;
+
+    if (capturePromptActive) {
+        if (inLeftBtn) {
+            // KEEP: capture (and device/port) fully retained.
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> capture prompt KEEP\n", touchX, touchY);
+            capturePromptActive = false;
+            goToPage(PAGE_EDIT_PORTS);
+        } else if (inRightBtn) {
+            // DISCARD: clears capture only - device/port untouched.
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> capture prompt DISCARD\n", touchX, touchY);
+            capturePromptActive = false;
+            editCtx.captured_input = MKH_INPUT_NONE;
+            editCtx.capture_valid = false;
+            goToPage(PAGE_EDIT_PORTS);
+        }
+        return;
+    }
+
+    if (inLeftBtn) {
+        if (editCtx.capture_valid) {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> capture BACK, prompting (capture set)\n", touchX,
+                            touchY);
+            capturePromptActive = true;
+            drawCapturePromptOverlay();
+        } else {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> capture BACK, silent (no capture)\n", touchX,
+                            touchY);
+            goToPage(PAGE_EDIT_PORTS);
+        }
+    } else if (inRightBtn && captureHasNext()) {
+        // NEXT never prompts - forward is an implicit keep (capture is
+        // already sitting in editCtx; there is nothing more to commit).
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> capture NEXT -> settings\n", touchX, touchY);
+        goToPage(PAGE_EDIT_SETTINGS);
     }
 }
 
@@ -814,7 +997,7 @@ static void goToPage(UiPage page) {
             drawPortSelect();
             break;
         case PAGE_EDIT_CAPTURE: {
-            // WO10 Step 1: title now proves the editing context flows
+            // WO10 Step 1: title proves the editing context flows
             // forward, instead of a static placeholder string. ASCII
             // hyphen, not the order's example "·" middle-dot, since the
             // display's built-in bitmap font isn't guaranteed to have a
@@ -826,7 +1009,12 @@ static void goToPage(UiPage page) {
             } else {
                 snprintf(title, sizeof(title), "EDIT: CAPTURE INPUT");
             }
-            drawEditorPlaceholder(title, page);
+            // WO10 Step 2: real capture page now (drawCapturePage(),
+            // not the generic placeholder). Prompt state is reset on
+            // every entry - it's this page's own sub-state, never
+            // meaningful to carry across a navigation.
+            capturePromptActive = false;
+            drawCapturePage(title);
             break;
         }
         case PAGE_EDIT_SETTINGS:
@@ -838,13 +1026,13 @@ static void goToPage(UiPage page) {
 }
 
 // WO10 Step 1: PAGE_EDIT_SELECT no longer has a case here - it's never
-// passed in (dispatchHubSelectTouch() handles its own Back). CAPTURE's
-// Back target moved from PAGE_EDIT_SELECT to PAGE_EDIT_PORTS, since
-// PORTS is now the immediate predecessor in the corridor.
+// passed in (dispatchHubSelectTouch() handles its own Back).
+// WO10 Step 2: PAGE_EDIT_CAPTURE's case removed too - it left this
+// generic pattern for dispatchCaptureTouch()'s own Back handling
+// (prompt-gated, unlike this function's unconditional navigation).
+// PAGE_EDIT_SETTINGS is the only page left using this generic path.
 static UiPage editorBackTarget(UiPage page) {
     switch (page) {
-        case PAGE_EDIT_CAPTURE:
-            return PAGE_EDIT_PORTS;
         case PAGE_EDIT_SETTINGS:
             return PAGE_EDIT_CAPTURE;
         default:
@@ -852,13 +1040,13 @@ static UiPage editorBackTarget(UiPage page) {
     }
 }
 
+// WO10 Step 2: no case is reachable here anymore - PAGE_EDIT_CAPTURE's
+// Next is now dispatchCaptureTouch()'s own (captureHasNext() ->
+// PAGE_EDIT_SETTINGS directly), and pageHasNext() below always returns
+// false for this function's only remaining caller (PAGE_EDIT_SETTINGS,
+// which has no Next). Kept for interface stability rather than deleted.
 static UiPage editorNextTarget(UiPage page) {
-    switch (page) {
-        case PAGE_EDIT_CAPTURE:
-            return PAGE_EDIT_SETTINGS;
-        default:
-            return page;  // no Next from SETTINGS - button isn't drawn there
-    }
+    return page;
 }
 
 // Editor pages' own hit zones (WO10 Step 0's "own hit zones" per page,
@@ -1293,6 +1481,68 @@ void processControllers() {
     }
 }
 
+// WO10 Step 2: capture logic. Read-only observation of Bluepad32's
+// existing controller state - myControllers[0] is the exact same
+// pointer processControllers()/processGamepad() already read above;
+// this is not a second read path and processControllers() itself is
+// untouched. Called once per loop() iteration while sitting on the
+// capture page (see loop() below) - first input past threshold wins,
+// and capture always overwrites on a later distinct crossing (wiggle
+// again = new capture, no confirm step, by design).
+//
+// Threshold: MKH_CAPTURE_THRESHOLD_PERCENT=25, chosen to comfortably
+// clear MKH_STICK_DEADZONE_PERCENT (8%) - roughly 3x - so it's well
+// above any resting/analog noise the deadzone itself doesn't already
+// absorb, while still being a modest, not-full-deflection push that
+// any deliberate "wiggle" clears without requiring precision from the
+// user.
+#define MKH_CAPTURE_THRESHOLD_PERCENT 25
+
+static bool stickPastCaptureThreshold(int32_t axisValue) {
+    const int32_t threshold = (MKH_STICK_AXIS_MAGNITUDE * MKH_CAPTURE_THRESHOLD_PERCENT) / 100;
+    return axisValue <= -threshold || axisValue >= threshold;
+}
+
+// Applies a new capture, but only if it actually changes anything -
+// holding a stick past threshold re-evaluates every ~150ms loop tick,
+// and without this guard that would re-log and re-redraw the (already
+// current) status line every tick for as long as the stick stays held.
+static void applyCapture(mkh_input_source_t token) {
+    if (editCtx.capture_valid && editCtx.captured_input == token)
+        return;
+    bool hadCapture = editCtx.capture_valid;
+    editCtx.captured_input = token;
+    editCtx.capture_valid = true;
+    Console.printf("MK1 Capture: %s captured\n", mkhCaptureTokenLabel(token));
+    drawCaptureStatus();
+    if (!hadCapture) {
+        drawCaptureButtons();  // NEXT appears for the first time
+    }
+}
+
+static void checkCapture() {
+    ControllerPtr ctl = myControllers[0];
+    if (!ctl || !ctl->isConnected())
+        return;
+
+    if (stickPastCaptureThreshold(ctl->axisY())) {
+        applyCapture(MKH_INPUT_LSNS);
+        return;
+    }
+    if (stickPastCaptureThreshold(ctl->axisRY())) {
+        applyCapture(MKH_INPUT_RSNS);
+        return;
+    }
+    // Buttons: mkh_config.c's kInputTokens currently defines LSNS/RSNS
+    // only (both stick axes) - there is no button token to check
+    // against yet, so every button press correctly falls through as
+    // ignored here. Not a stub or a gap: per the order, "inputs without
+    // config tokens are ignored (no capture, no error)," and right now
+    // that's every button. Add a check here (paired with a new token in
+    // mkh_config.c/mkh_config.h) if/when a future order defines one -
+    // "do not invent new tokens" is why this step doesn't.
+}
+
 // Arduino setup function. Runs in CPU 1
 void setup() {
     // v0.8.0 Step 0b: LittleFS storage foundation. Internal flash has no
@@ -1416,8 +1666,10 @@ void loop() {
     // dashboard) and PAGE_SPLASH (no interaction, boot-driven only).
     //
     // WO10 Step 1: PAGE_EDIT_SELECT/PAGE_EDIT_PORTS get their own custom
-    // dispatch functions now (not dispatchEditorTouch() - that's CAPTURE/
-    // SETTINGS only).
+    // dispatch functions now (not dispatchEditorTouch()).
+    //
+    // WO10 Step 2: PAGE_EDIT_CAPTURE too (dispatchCaptureTouch()) -
+    // dispatchEditorTouch() now only serves PAGE_EDIT_SETTINGS.
     int16_t touchX, touchY;
     if (mkh_touch_poll(&touchX, &touchY)) {
         if (currentPage == PAGE_DASHBOARD) {
@@ -1504,8 +1756,13 @@ void loop() {
             dispatchHubSelectTouch(touchX, touchY);
         } else if (currentPage == PAGE_EDIT_PORTS) {
             dispatchPortSelectTouch(touchX, touchY);
+        } else if (currentPage == PAGE_EDIT_CAPTURE) {
+            // WO10 Step 2: capture page has its own custom hit zones too
+            // (Back is prompt-gated, unlike the generic pattern's
+            // unconditional navigation) - see dispatchCaptureTouch().
+            dispatchCaptureTouch(touchX, touchY);
         } else {
-            // CAPTURE, SETTINGS - still the generic placeholder pattern.
+            // SETTINGS only now - still the generic placeholder pattern.
             dispatchEditorTouch(touchX, touchY);
         }
     }
@@ -1514,6 +1771,16 @@ void loop() {
         updateDashboard();
     } else if (currentPage == PAGE_STATS) {
         updateStatsUptime();
+    } else if (currentPage == PAGE_EDIT_CAPTURE && !capturePromptActive) {
+        // WO10 Step 2: capture-token detection runs every tick while
+        // sitting on the capture page - but not while the leave-page
+        // prompt is up, so a stick left resting past threshold can't
+        // silently change the very capture the prompt is asking about.
+        // Broadcast/motor response is untouched by this gate - that's
+        // driven by processControllers()/processGamepad() above,
+        // unconditionally, on every page (PM ruling: capture never
+        // suppresses driving).
+        checkCapture();
     }
 
     // The main loop must have some kind of "yield to lower priority task" event.
