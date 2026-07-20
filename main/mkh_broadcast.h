@@ -38,6 +38,41 @@ extern bool mkh_hub_broadcasting[MKH_MK6_NUM_DEVICES];
 // that builds telegrams.
 void mkh_set_channel(int device_id, int port, uint8_t value);
 
+// v0.9.0 Step 1: per-hub broadcast toggles. Both functions own their
+// full safety-ordered sequencing internally (see mkh_broadcast.c) -
+// callers (the touch handler in sketch.cpp) just dispatch the request;
+// they must not try to replicate the ordering themselves. Both are
+// idempotent (calling toggle_off while already off/dropping, or
+// toggle_on while already fully on, is a no-op) and safe to call from
+// any task (same mutex-protected path as mkh_set_channel()).
+//
+// toggle_off: commands every channel of device_id to neutral (0x80)
+// immediately, but keeps the device in the CONTROL rotation for several
+// more services so neutral actually airs before the device is dropped -
+// never removes a hub that might still be coasting on a non-neutral
+// order.
+void mkh_broadcast_toggle_off(int device_id);
+
+// toggle_on: re-broadcasts the (unaddressed, shared) CONNECT telegram
+// once - harmless to other hubs, and re-acquires a hub that may have
+// timed out off-rotation, same principle as BC2's idle-reconnect - then
+// re-adds device_id to the CONTROL rotation at neutral. Devices at or
+// beyond MKH_TIME_SLICE_NUM_DEVICES (see mkh_broadcast.c) stay parked -
+// WO9 does not authorize activating the third hub's live broadcast;
+// calling toggle_on for a parked device logs why and does nothing else
+// (does not enter the transitioning state below).
+void mkh_broadcast_toggle_on(int device_id);
+
+// v0.9.0 Step 1 (PM feedback pass): true from the moment a real (non-
+// idempotent) toggle request is accepted until its sequence actually
+// completes - the drop for OFF, the re-add for ON. This is the real
+// guard against a tap landing mid-sequence; callers (sketch.cpp) must
+// check this BEFORE dispatching a new toggle request for the same
+// device and ignore the tap if true, logging why. The ~200ms debounce
+// stays as an additional, secondary guard on top of this, not a
+// replacement for it.
+bool mkh_broadcast_is_transitioning(int device_id);
+
 #ifdef __cplusplus
 }
 #endif

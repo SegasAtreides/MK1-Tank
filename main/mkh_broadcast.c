@@ -81,11 +81,25 @@
 // CONTROL telegram - see the file header comment.
 #define MKH_CONTROL_REPEAT_MS 100
 
-// Number of devices actively serviced by the time-slice rotation. Step 1
-// covers devices 0 and 1 (a second physical hub); device slot 2 already
-// exists in the per-device arrays below ("leave room for 2") but isn't in
-// rotation yet - bump this to MKH_MK6_NUM_DEVICES when it joins.
+// Number of devices ELIGIBLE for the CONTROL time-slice rotation. Step 1
+// (v0.9.0) covers devices 0 and 1 (two physical hubs, now individually
+// toggleable on/off - see mkh_device_active[] below); device slot 2
+// already exists in the per-device arrays ("leave room for 3") but is
+// not eligible yet - WO9 does not authorize activating the third hub's
+// live broadcast, so mkh_broadcast_toggle_on() refuses it (logs why,
+// does nothing else). Bump this to MKH_MK6_NUM_DEVICES on a future,
+// explicit go-ahead to let it join.
 #define MKH_TIME_SLICE_NUM_DEVICES 2
+
+// How many times a device must actually be SERVICED (a real telegram
+// airing its now-neutral values) after a toggle-off request before it
+// is safe to drop from rotation - see mkh_broadcast_toggle_off() and
+// the countdown in mkh_broadcast_control(). WO9: ">=3 full cycles so
+// neutral actually airs". With MKH_TIME_SLICE_NUM_DEVICES devices
+// sharing the rotation, "this device serviced N times" and "N full
+// rotation cycles" are the same thing (each full cycle services every
+// active device exactly once).
+#define MKH_OFF_GRACE_SERVICES 3
 
 static btstack_packet_callback_registration_t mkh_hci_event_callback_registration;
 static bool mkh_advertising_started = false;
@@ -119,6 +133,29 @@ void mkh_set_channel(int device_id, int port, uint8_t value) {
     xSemaphoreTake(mkh_channel_mutex, portMAX_DELAY);
     mkh_channel_value[device_id][port] = value;
     xSemaphoreGive(mkh_channel_mutex);
+}
+
+// v0.9.0 Step 1: which devices are eligible for the CONTROL rotation
+// right now. Distinct from mkh_hub_broadcasting[] (the dashboard-facing
+// "true broadcast state" WO9 asks for) - during a toggle-off's neutral-
+// airing grace period a device is still active (still rotating, still
+// dashboard-green) even though its removal is already pending; see
+// mkh_pending_off_services[] below. Initialized in mkh_broadcast_init().
+static bool mkh_device_active[MKH_MK6_NUM_DEVICES];
+
+// >0 while device_id is in its OFF grace period (see
+// MKH_OFF_GRACE_SERVICES); decremented once per actual service in
+// mkh_broadcast_control(), and the device is dropped from rotation when
+// it reaches 0. 0 means no pending removal.
+static int mkh_pending_off_services[MKH_MK6_NUM_DEVICES];
+
+// See mkh_broadcast_is_transitioning() in the header for the contract.
+static bool mkh_device_transitioning[MKH_MK6_NUM_DEVICES];
+
+bool mkh_broadcast_is_transitioning(int device_id) {
+    if (device_id < 0 || device_id >= MKH_MK6_NUM_DEVICES)
+        return false;
+    return mkh_device_transitioning[device_id];
 }
 
 static bd_addr_t mkh_null_addr = {0, 0, 0, 0, 0, 0};
@@ -164,16 +201,39 @@ static bool mkh_control_logged_once[MKH_MK6_NUM_DEVICES] = {false};
 
 // Which device's CONTROL telegram gets staged next. Only one telegram can
 // be on air at a time (unaddressed hubs simply coast until a telegram
-// with their address arrives), so this rotates through the devices in
-// MKH_TIME_SLICE_NUM_DEVICES each time this function runs - i.e. each
-// specific device's own telegram effectively refreshes every
-// (MKH_TIME_SLICE_NUM_DEVICES * MKH_CONTROL_REPEAT_MS)ms, not every
-// MKH_CONTROL_REPEAT_MS.
-static int mkh_time_slice_next_device = 0;
+// with their address arrives), so this rotates through whichever devices
+// are currently mkh_device_active[] each time this function runs - i.e.
+// each specific device's own telegram effectively refreshes every
+// (active_count * MKH_CONTROL_REPEAT_MS)ms, not every MKH_CONTROL_REPEAT_MS.
+// v0.9.0 Step 1: the active set is now runtime-toggleable (see
+// mkh_broadcast_toggle_off()/_on()), not the fixed 0..MKH_TIME_SLICE_
+// NUM_DEVICES-1 range Step 1 (v0.7.0) hardcoded - mkh_next_active_device()
+// below walks around whichever devices are active starting just after
+// the last-serviced one.
+static int mkh_time_slice_last_device = -1;
+
+// Returns the next active device after `after` (round-robin), or -1 if
+// none are active right now (e.g. both hubs toggled off - see WO9 Step
+// 2 bench plan: "Then both off, both on").
+static int mkh_next_active_device(int after) {
+    for (int i = 1; i <= MKH_MK6_NUM_DEVICES; i++) {
+        int candidate = (after + i + MKH_MK6_NUM_DEVICES) % MKH_MK6_NUM_DEVICES;
+        if (mkh_device_active[candidate])
+            return candidate;
+    }
+    return -1;
+}
 
 static void mkh_broadcast_control(btstack_timer_source_t* ts) {
-    int device_id = mkh_time_slice_next_device;
-    mkh_time_slice_next_device = (mkh_time_slice_next_device + 1) % MKH_TIME_SLICE_NUM_DEVICES;
+    int device_id = mkh_next_active_device(mkh_time_slice_last_device);
+    if (device_id < 0) {
+        // Nothing active right now - nothing to stage. Still re-arm so
+        // we notice as soon as a hub is toggled back on.
+        btstack_run_loop_set_timer(ts, MKH_CONTROL_REPEAT_MS);
+        btstack_run_loop_add_timer(ts);
+        return;
+    }
+    mkh_time_slice_last_device = device_id;
 
     uint8_t values[MKH_MK6_NUM_CHANNELS];
     xSemaphoreTake(mkh_channel_mutex, portMAX_DELAY);
@@ -206,11 +266,30 @@ static void mkh_broadcast_control(btstack_timer_source_t* ts) {
     size_t payload_len = mkh_protocol_encrypt(telegram, sizeof(telegram), payload, sizeof(payload));
     mkh_set_adv_payload(payload, payload_len);
 
-    // Dashboard: this device is now (and henceforth) serviced by the
-    // time-slicer. Nothing currently drops a device back out of rotation
-    // (no stop/idle trigger exists yet), so there is no corresponding
-    // "set false" path yet.
+    // Dashboard: this device is now (and continues to be) serviced by
+    // the time-slicer - true broadcast state, per WO9.
     mkh_hub_broadcasting[device_id] = true;
+
+    // v0.9.0 Step 1: safety-ordered OFF sequence, second half. The first
+    // half (commanding neutral, starting the countdown) already ran
+    // synchronously in mkh_broadcast_toggle_off() when the user tapped.
+    // This device just aired a real telegram (neutral, since toggle_off
+    // already committed 0x80 to every channel) - only NOW does it count
+    // as one of the >=3 required neutral-airings. Reaching zero here is
+    // the sole point that actually drops the device from rotation and
+    // flips the dashboard to red; never done synchronously in the
+    // toggle request itself, so a hub already coasting on a non-neutral
+    // order can never be dropped before neutral has genuinely gone out.
+    if (mkh_pending_off_services[device_id] > 0) {
+        mkh_pending_off_services[device_id]--;
+        if (mkh_pending_off_services[device_id] == 0) {
+            mkh_device_active[device_id] = false;
+            mkh_hub_broadcasting[device_id] = false;
+            mkh_device_transitioning[device_id] = false;  // OFF sequence genuinely complete now
+            logi("MK6 Broadcast: device=%d dropped from rotation (neutral aired %d times)\n", device_id,
+                 MKH_OFF_GRACE_SERVICES);
+        }
+    }
 
     if (changed) {
         mkh_log_hex("CONTROL raw telegram", telegram, sizeof(telegram));
@@ -253,6 +332,64 @@ static void mkh_broadcast_connect(void) {
     btstack_run_loop_set_timer_handler(&mkh_broadcast_timer, &mkh_broadcast_control);
     btstack_run_loop_set_timer(&mkh_broadcast_timer, MKH_CONNECT_PHASE_MS);
     btstack_run_loop_add_timer(&mkh_broadcast_timer);
+}
+
+// v0.9.0 Step 1: per-hub broadcast toggles - see mkh_broadcast.h for the
+// caller-facing contract (idempotent, own their full sequencing).
+
+void mkh_broadcast_toggle_off(int device_id) {
+    if (device_id < 0 || device_id >= MKH_MK6_NUM_DEVICES)
+        return;
+    if (!mkh_device_active[device_id] || mkh_pending_off_services[device_id] > 0)
+        return;  // already off, or already dropping - idempotent
+
+    mkh_device_transitioning[device_id] = true;  // cleared when the drop actually completes, below
+
+    for (int ch = 0; ch < MKH_MK6_NUM_CHANNELS; ch++) {
+        mkh_set_channel(device_id, ch, 0x80);
+    }
+    mkh_pending_off_services[device_id] = MKH_OFF_GRACE_SERVICES;
+    logi("MK6 Broadcast: device=%d toggle OFF requested - neutral commanded, staying in rotation for %d more "
+         "services before drop\n",
+         device_id, MKH_OFF_GRACE_SERVICES);
+}
+
+void mkh_broadcast_toggle_on(int device_id) {
+    if (device_id < 0 || device_id >= MKH_MK6_NUM_DEVICES)
+        return;
+    if (device_id >= MKH_TIME_SLICE_NUM_DEVICES) {
+        logi("MK6 Broadcast: device=%d toggle ON ignored - third hub stays parked per WO9 (not authorized to "
+             "activate live broadcast)\n",
+             device_id);
+        return;
+    }
+    if (mkh_device_active[device_id] && mkh_pending_off_services[device_id] == 0)
+        return;  // already fully on - idempotent
+
+    mkh_device_transitioning[device_id] = true;  // cleared right before returning below - ON is synchronous/atomic
+
+    mkh_pending_off_services[device_id] = 0;  // cancel any pending drop - re-enabling wins
+
+    for (int ch = 0; ch < MKH_MK6_NUM_CHANNELS; ch++) {
+        mkh_set_channel(device_id, ch, 0x80);
+    }
+
+    // Re-run the CONNECT telegram sequence. It is broadcast, not
+    // addressed (see the file header comment), so this is harmless to
+    // other hubs - it re-acquires a hub that may have timed out off-
+    // rotation, same principle as BrickController2's idle-reconnect.
+    uint8_t telegram[MKH_TELEGRAM_CONNECT_LEN];
+    mkh_protocol_connect_telegram(telegram);
+    mkh_log_hex("CONNECT raw telegram (toggle ON replay)", telegram, sizeof(telegram));
+    uint8_t payload[MKH_PAYLOAD_CONNECT_LEN];
+    size_t payload_len = mkh_protocol_encrypt(telegram, sizeof(telegram), payload, sizeof(payload));
+    mkh_log_hex("CONNECT encrypted payload (toggle ON replay)", payload, payload_len);
+    mkh_set_adv_payload(payload, payload_len);
+
+    mkh_device_active[device_id] = true;
+    mkh_hub_broadcasting[device_id] = true;
+    mkh_device_transitioning[device_id] = false;  // re-add complete
+    logi("MK6 Broadcast: device=%d toggle ON - CONNECT replayed, re-added to rotation at neutral\n", device_id);
 }
 
 static void mkh_start(void) {
@@ -326,6 +463,16 @@ static void mkh_broadcast_packet_handler(uint8_t packet_type, uint16_t channel, 
 
 void mkh_broadcast_init(void) {
     mkh_channel_mutex = xSemaphoreCreateMutex();
+
+    // v0.9.0 Step 1: devices below MKH_TIME_SLICE_NUM_DEVICES start
+    // active, reproducing v0.7.0/v0.8.0 behavior exactly (both hubs
+    // live from boot); anything at or beyond it (the third hub) starts
+    // parked. No device starts with a pending OFF grace period.
+    for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++) {
+        mkh_device_active[d] = (d < MKH_TIME_SLICE_NUM_DEVICES);
+        mkh_pending_off_services[d] = 0;
+        mkh_device_transitioning[d] = false;
+    }
 
     mkh_hci_event_callback_registration.callback = &mkh_broadcast_packet_handler;
     hci_add_event_handler(&mkh_hci_event_callback_registration);

@@ -30,6 +30,7 @@ static const mkh_input_token_t kInputTokens[] = {
 
 static mkh_port_config_t s_table[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS];
 static bool s_source_is_file = false;
+static int s_skipped_lines = 0;
 
 void mkh_config_set_defaults(void) {
     for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++) {
@@ -44,6 +45,11 @@ void mkh_config_set_defaults(void) {
     // stick -> device 1 port A.
     s_table[0][MKH_PORT_A].input = MKH_INPUT_LSNS;
     s_table[1][MKH_PORT_A].input = MKH_INPUT_RSNS;
+    s_skipped_lines = 0;
+}
+
+int mkh_config_get_skipped_line_count(void) {
+    return s_skipped_lines;
 }
 
 void mkh_config_note_source(bool from_file) {
@@ -104,6 +110,7 @@ void mkh_config_parse_line(const char* raw_line) {
     char* eq = strchr(line, '=');
     if (!eq) {
         loge("MK1 Config: malformed line (no '='), skipped: \"%s\"\n", trimmed);
+        s_skipped_lines++;
         return;
     }
     *eq = '\0';
@@ -115,18 +122,21 @@ void mkh_config_parse_line(const char* raw_line) {
     char port_letter = 0;
     if (sscanf(key, "HUB%d_PORT_%c", &hub_num, &port_letter) != 2) {
         loge("MK1 Config: unrecognized key \"%s\", line skipped\n", key);
+        s_skipped_lines++;
         return;
     }
 
     int device_id = mkh_device_protocol_index(hub_num);
     if (device_id < 0) {
         loge("MK1 Config: HUB%d out of range (1-%d), line skipped\n", hub_num, MKH_MK6_NUM_DEVICES);
+        s_skipped_lines++;
         return;
     }
 
     int port = mkh_port_from_letter(port_letter);
     if (port < 0) {
         loge("MK1 Config: HUB%d_PORT_%c invalid port letter, line skipped\n", hub_num, port_letter);
+        s_skipped_lines++;
         return;
     }
 
@@ -138,6 +148,7 @@ void mkh_config_parse_line(const char* raw_line) {
     char* tok = strtok_r(value_buf, " \t", &saveptr);
     if (!tok) {
         loge("MK1 Config: HUB%d_PORT_%c missing input assignment, line skipped\n", hub_num, port_letter);
+        s_skipped_lines++;
         return;
     }
 
@@ -152,6 +163,7 @@ void mkh_config_parse_line(const char* raw_line) {
     }
     if (!input_found) {
         loge("MK1 Config: HUB%d_PORT_%c unknown input token \"%s\", line skipped\n", hub_num, port_letter, tok);
+        s_skipped_lines++;
         return;
     }
 
@@ -162,6 +174,7 @@ void mkh_config_parse_line(const char* raw_line) {
         char* attr_eq = strchr(tok, '=');
         if (!attr_eq) {
             loge("MK1 Config: HUB%d_PORT_%c malformed attribute \"%s\", line skipped\n", hub_num, port_letter, tok);
+            s_skipped_lines++;
             return;
         }
         *attr_eq = '\0';
@@ -176,6 +189,7 @@ void mkh_config_parse_line(const char* raw_line) {
             } else {
                 loge("MK1 Config: HUB%d_PORT_%c invalid invert=\"%s\" (want yes/no), line skipped\n", hub_num,
                      port_letter, attr_val);
+                s_skipped_lines++;
                 return;
             }
         } else if (strcasecmp(attr_key, "max") == 0) {
@@ -184,6 +198,7 @@ void mkh_config_parse_line(const char* raw_line) {
             if (endptr == attr_val || *endptr != '\0' || v < 0 || v > 100) {
                 loge("MK1 Config: HUB%d_PORT_%c invalid max=\"%s\" (want 0-100), line skipped\n", hub_num,
                      port_letter, attr_val);
+                s_skipped_lines++;
                 return;
             }
             max_percent = (uint8_t)v;
@@ -197,6 +212,7 @@ void mkh_config_parse_line(const char* raw_line) {
             }
         } else {
             loge("MK1 Config: HUB%d_PORT_%c unknown key \"%s\", line skipped\n", hub_num, port_letter, attr_key);
+            s_skipped_lines++;
             return;
         }
     }

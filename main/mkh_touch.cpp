@@ -17,13 +17,22 @@
 // in existence. Nothing in this driver assumes 100kHz specifically -
 // revisit once IMU integration establishes real timing requirements.
 //
-// TP_INT (IO46): used, but only as a cheap polled "is there new data"
-// gate (digitalRead), not a true interrupt/ISR - an ISR would still
-// have to defer the actual I2C read out of interrupt context (I2C
-// transactions are not ISR-safe), which is unnecessary complexity for
-// v1. This is the straightforward, no-ISR middle ground the work order
-// allows: still event-gated (no I2C traffic when there's nothing to
-// read), just not interrupt-driven.
+// TP_INT (IO46): v1 (WO9 Step 0) used this as a cheap polled digitalRead
+// gate rather than a true interrupt, reasoning the extra complexity
+// wasn't needed. WO9 Step 1's PM bench testing proved that wrong: level-
+// polling a pulse-based interrupt line at ~150ms (main loop cadence) or
+// even ~40ms (during a switch animation - see sketch.cpp) can simply
+// miss a pulse shorter than the polling gap, for a press, a release, or
+// both - reproduced as a deterministic "works once after reset, then
+// stuck" failure (diagnostic: repeated real finger contact produced NO
+// PRESS/RELEASE log lines at all, ruling out a lockout/logic bug in the
+// caller). Fixed by moving to a real FALLING-edge hardware interrupt
+// (attachInterrupt below): the ISR only sets a flag - no I2C, no
+// logging, nothing not ISR-safe - and mkh_touch_poll() below consumes
+// that flag and does the actual (non-ISR-context) I2C read. This can no
+// longer miss a pulse regardless of how it relates to the loop's own
+// timing, since the hardware interrupt fires independently of anything
+// this firmware is doing when the edge occurs.
 //
 // Register map: only FINGER_NUM (0x02) and the X/Y position registers
 // (0x03-0x06) are used - these are consistent across the CST816S/T/D
@@ -87,6 +96,18 @@
 static bool s_touchReady = false;
 static bool s_wasPressed = false;
 
+// Set by touchIsr() (hardware interrupt context - IRAM-resident,
+// minimal, no I2C/logging), cleared by mkh_touch_poll() (normal task
+// context, where the actual I2C read happens). volatile because it's
+// shared between an ISR and the main loop with no other synchronization
+// - a plain flag is sufficient here since it's just a single-bit
+// "something happened" signal, not a multi-field structure.
+static volatile bool s_touchIntFlag = false;
+
+static void IRAM_ATTR touchIsr(void) {
+    s_touchIntFlag = true;
+}
+
 // The one site implementing the touch->display transform - see the
 // derivation comment above this file's header block.
 static void mkh_touch_raw_to_display(uint16_t rawX, uint16_t rawY, int16_t* displayX, int16_t* displayY) {
@@ -144,20 +165,25 @@ void mkh_touch_init(void) {
 
     logi("MK1 Touch: CST816D acknowledged at I2C 0x%02X (SDA=%d, SCL=%d, %luHz)\n", CST816D_I2C_ADDR, TP_SDA_PIN,
          TP_SCL_PIN, (unsigned long)I2C_FREQUENCY_HZ);
+
+    attachInterrupt(digitalPinToInterrupt(TP_INT_PIN), touchIsr, FALLING);
     s_touchReady = true;
 }
 
-void mkh_touch_poll(void) {
+bool mkh_touch_poll(int16_t* outDisplayX, int16_t* outDisplayY) {
     if (!s_touchReady)
-        return;
+        return false;
 
-    if (digitalRead(TP_INT_PIN) != LOW)
-        return;
+    if (!s_touchIntFlag)
+        return false;
+    s_touchIntFlag = false;  // clear BEFORE the I2C read - if another edge
+                              // arrives mid-read, we want it re-armed for
+                              // the NEXT poll, not silently dropped
 
     uint8_t buf[5];  // FINGER_NUM, XPOS_H, XPOS_L, YPOS_H, YPOS_L
     if (!cst816ReadRegs(REG_FINGER_NUM, buf, sizeof(buf))) {
         loge("MK1 Touch: read failed\n");
-        return;
+        return false;
     }
 
     uint8_t fingerNum = buf[0];
@@ -168,6 +194,11 @@ void mkh_touch_poll(void) {
     int16_t dispX, dispY;
     mkh_touch_raw_to_display(x, y, &dispX, &dispY);
 
+    // v0.9.0 Step 1: a tap is the rising edge only - computed before
+    // s_wasPressed is updated below, so it fires exactly once per
+    // press, on the same poll that logs "PRESS".
+    bool isNewPress = pressed && !s_wasPressed;
+
     if (pressed != s_wasPressed) {
         logi("MK1 Touch: %s raw=(x=%u, y=%u) display=(x=%d, y=%d)\n", pressed ? "PRESS" : "RELEASE", (unsigned)x,
              (unsigned)y, dispX, dispY);
@@ -177,4 +208,13 @@ void mkh_touch_poll(void) {
         // (see sketch.cpp), so this is not noisy.
         logi("MK1 Touch: MOVE  raw=(x=%u, y=%u) display=(x=%d, y=%d)\n", (unsigned)x, (unsigned)y, dispX, dispY);
     }
+
+    if (isNewPress) {
+        if (outDisplayX)
+            *outDisplayX = dispX;
+        if (outDisplayY)
+            *outDisplayY = dispY;
+        return true;
+    }
+    return false;
 }

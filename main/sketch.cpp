@@ -79,7 +79,6 @@ static void initMkhLabels() {
 }
 
 static uint16_t lastXwcColorDrawn = 0xFFFF;
-static uint16_t lastHubColorDrawn[3] = {0xFFFF, 0xFFFF, 0xFFFF};
 static uint32_t lastUptimeDrawnSec = 0xFFFFFFFF;
 
 static int16_t rowTop(int idx) {
@@ -102,7 +101,23 @@ static void drawHeader() {
     // spare header space at size 1 rather than adding a dashboard row.
     // Config is read once at boot (no hot-reload), so this is drawn once
     // here and never needs to be refreshed like the status dots.
-    const char* cfgLabel = mkh_config_source_is_file() ? "CFG:FS" : "CFG:DEF";
+    //
+    // v0.9.0 Step 1: CFG-honesty tweak - a third, degraded state.
+    // CFG:DEF = fell back to compiled-in defaults (no file / open
+    // failed). CFG:FS = file parsed with zero skipped lines. CFG:FS! =
+    // file parsed but >=1 line was rejected as malformed (see
+    // mkh_config_get_skipped_line_count() and the per-line "skipped"
+    // warnings in the boot log for which).
+    const char* cfgLabel;
+    if (!mkh_config_source_is_file()) {
+        cfgLabel = "CFG:DEF";
+    } else if (mkh_config_get_skipped_line_count() > 0) {
+        cfgLabel = "CFG:FS!";
+    } else {
+        cfgLabel = "CFG:FS";
+    }
+    Console.printf("MK1 Dashboard: CFG field = %s (skipped_lines=%d)\n", cfgLabel,
+                    mkh_config_get_skipped_line_count());
     display->setTextSize(1);
     int16_t cfgX = SCR_W - ROW_MARGIN - textWidth(cfgLabel, 1);
     display->setCursor(cfgX, (HEADER_H - 8) / 2);
@@ -124,6 +139,85 @@ static void drawStatusDot(int idx, uint16_t color) {
     int16_t cx = SCR_W - ROW_MARGIN - 22;
     int16_t cy = y + ROW_H / 2;
     display->fillCircle(cx, cy, 10, color);
+}
+
+// v0.9.0 Step 1, Amendment B: MKH rows get a toggle SWITCH widget
+// (pill track + sliding knob) in place of the status dot, right-aligned
+// in the same footprint the dot used to occupy. XWC's dot (above) and
+// its red/yellow/green tricolor semantics are UNTOUCHED - switches are
+// MKH rows only.
+//
+// Geometry: track 36x16px, pill-rounded (radius = height/2 = 8); knob
+// radius 6px, 2px inset from each track end. Right-aligned to the same
+// SCR_W-ROW_MARGIN edge the dot used.
+//   track: x=[278, 314], y = rowTop(idx)+10 .. +26
+//   knob center y = rowTop(idx)+18 (vertically centered in track)
+//   knob center x: OFF (left) = 286, ON (right) = 306 (20px travel)
+static const int16_t SWITCH_TRACK_W = 36;
+static const int16_t SWITCH_TRACK_H = 16;
+static const int16_t SWITCH_KNOB_R = 6;
+static const int16_t SWITCH_PAD = 2;
+static const int16_t SWITCH_TRACK_RIGHT = SCR_W - ROW_MARGIN;                    // 314
+static const int16_t SWITCH_TRACK_LEFT = SWITCH_TRACK_RIGHT - SWITCH_TRACK_W;    // 278
+static const int16_t SWITCH_KNOB_CX_OFF = SWITCH_TRACK_LEFT + SWITCH_KNOB_R + SWITCH_PAD;   // 286
+static const int16_t SWITCH_KNOB_CX_ON = SWITCH_TRACK_RIGHT - SWITCH_KNOB_R - SWITCH_PAD;   // 306
+
+static void drawToggleSwitch(int idx, int16_t knobCx, uint16_t trackColor) {
+    int16_t y = rowTop(idx);
+    int16_t trackTop = y + (ROW_H - SWITCH_TRACK_H) / 2;
+    int16_t knobCy = trackTop + SWITCH_TRACK_H / 2;
+
+    // Erase the whole widget footprint (track + knob's extra radius)
+    // back to the card background before redrawing - same fixed-
+    // position-redraw reasoning as drawStatusDot(), just a wider rect
+    // since track+knob together exceed a single circle's bounds.
+    display->fillRect(SWITCH_TRACK_LEFT - SWITCH_KNOB_R, trackTop - SWITCH_PAD,
+                       SWITCH_TRACK_W + 2 * SWITCH_KNOB_R + 2 * SWITCH_PAD, SWITCH_TRACK_H + 2 * SWITCH_PAD,
+                       COLOR_CARD_BG);
+
+    display->fillRoundRect(SWITCH_TRACK_LEFT, trackTop, SWITCH_TRACK_W, SWITCH_TRACK_H, SWITCH_TRACK_H / 2,
+                            trackColor);
+    display->fillCircle(knobCx, knobCy, SWITCH_KNOB_R, COLOR_LABEL);
+}
+
+// Slides the knob to its new position over a few frames - presentation
+// only. The caller (loop(), below) has ALWAYS already dispatched the
+// real toggle sequencing (mkh_broadcast_toggle_off/_on) before calling
+// this - drawing never gates or delays it, only follows it.
+//
+// Commanded vs. observed (WO9 PM decision): this switch shows COMMANDED
+// state and animates the instant a tap is accepted, before the neutral-
+// then-drop/CONNECT-replay sequence underneath finishes - unlike the
+// XWC dot above (xwcColor()/drawStatusDot()), which shows OBSERVED
+// state and only ever updates when Bluepad32's own connection state
+// actually changes. Both are correct for their widget: XWC's state
+// isn't something this firmware commands, so there's nothing to show
+// but what's true; the MKH switch's whole point is to tell the user
+// their tap landed, immediately, while WO9's safety-ordered sequencing
+// still runs to completion regardless of what's drawn.
+static void animateToggleSwitch(int idx, bool turningOn) {
+    const int FRAMES = 4;
+    const int FRAME_DELAY_MS = 40;  // 4 * 40ms = 160ms, inside the 100-200ms target
+    int16_t xStart = turningOn ? SWITCH_KNOB_CX_OFF : SWITCH_KNOB_CX_ON;
+    int16_t xEnd = turningOn ? SWITCH_KNOB_CX_ON : SWITCH_KNOB_CX_OFF;
+    uint16_t trackColor = turningOn ? COLOR_GREEN : COLOR_RED;
+    for (int f = 1; f <= FRAMES; f++) {
+        int16_t cx = xStart + (int16_t)(((int32_t)(xEnd - xStart) * f) / FRAMES);
+        drawToggleSwitch(idx, cx, trackColor);
+        delay(FRAME_DELAY_MS);
+
+        // PM bench finding: without this, a real release (or an entire
+        // press+release) landing inside this function's ~160ms of
+        // blocking delay is invisible to mkh_touch_poll() - it's
+        // otherwise only called once per loop() iteration, at the top -
+        // which permanently desyncs its press/release edge-detector and
+        // silently swallows every tap after the first. Discard the
+        // coordinates - this call exists purely to keep that state
+        // machine in sync during the blocking window, not to act on a
+        // tap mid-animation.
+        int16_t ignoredX, ignoredY;
+        mkh_touch_poll(&ignoredX, &ignoredY);
+    }
 }
 
 static uint16_t xwcColor() {
@@ -172,29 +266,33 @@ static void initDashboard() {
     lastXwcColorDrawn = xwcColor();
     drawStatusDot(ROW_XWC, lastXwcColorDrawn);
 
+    // At boot, commanded and observed state are trivially identical
+    // (nothing has been tapped yet) - see the commanded-vs-observed
+    // note on animateToggleSwitch() below.
     for (int i = 0; i < 3; i++) {
-        lastHubColorDrawn[i] = mkh_hub_broadcasting[i] ? COLOR_GREEN : COLOR_RED;
-        drawStatusDot(ROW_MKH0 + i, lastHubColorDrawn[i]);
+        uint16_t hc = mkh_hub_broadcasting[i] ? COLOR_GREEN : COLOR_RED;
+        int16_t knobCx = mkh_hub_broadcasting[i] ? SWITCH_KNOB_CX_ON : SWITCH_KNOB_CX_OFF;
+        drawToggleSwitch(ROW_MKH0 + i, knobCx, hc);
     }
 
     drawUptime(true);
 }
 
-// Redraws only what changed since the last call - keeps status dots steady
-// (no per-packet flicker) and avoids repainting the whole screen every loop.
+// Redraws only what changed since the last call. XWC's dot is the only
+// thing polled/diffed here - it shows OBSERVED state (there is no user
+// command for "connected", only Bluepad32's own connection events), so
+// polling is the only way it can ever update. MKH switches show
+// COMMANDED state instead (WO9 PM decision) and are drawn exclusively
+// by loop()'s tap handler via animateToggleSwitch(), immediately on tap
+// acceptance - never here, and never polled against mkh_hub_broadcasting[]
+// - so a switch's own animation is never second-guessed or overwritten
+// by this function once the sequence it's already displaying catches up
+// in the background.
 static void updateDashboard() {
     uint16_t c = xwcColor();
     if (c != lastXwcColorDrawn) {
         lastXwcColorDrawn = c;
         drawStatusDot(ROW_XWC, c);
-    }
-
-    for (int i = 0; i < 3; i++) {
-        uint16_t hc = mkh_hub_broadcasting[i] ? COLOR_GREEN : COLOR_RED;
-        if (hc != lastHubColorDrawn[i]) {
-            lastHubColorDrawn[i] = hc;
-            drawStatusDot(ROW_MKH0 + i, hc);
-        }
     }
 
     drawUptime(false);
@@ -346,6 +444,18 @@ void onDisconnectedController(ControllerPtr ctl) {
                 // heard. Table-driven, not hardcoded device indices, so
                 // it stays correct regardless of which hub/port the
                 // config maps LSNS/RSNS onto.
+                //
+                // v0.9.0 Step 1 invariant (where the two paths meet):
+                // this write is unconditional - it does not check
+                // mkh_hub_broadcasting[]/rotation state - and that's
+                // fine on both sides. A device still IN rotation picks
+                // the neutral value up normally on its next service. A
+                // device already toggled OFF is already neutral (that's
+                // exactly what mkh_broadcast_toggle_off() commands
+                // before it starts the drop countdown - see
+                // mkh_broadcast.c), so this write is a redundant no-op
+                // for it, not a gap. Either way, no device can resume
+                // from a stale non-neutral value after XWC disconnects.
                 for (int dev = 0; dev < MKH_MK6_NUM_DEVICES; dev++) {
                     for (int port = 0; port < MKH_MK6_NUM_CHANNELS; port++) {
                         const mkh_port_config_t* cfg = mkh_config_get(dev, port);
@@ -645,6 +755,43 @@ void setup() {
     BP32.enableBLEService(false);
 }
 
+// v0.9.0 Step 1, Amendment A: MKH row touch hit zones. Calibration
+// evidence (WO9 Step 0b) showed a tap can land a few pixels off the
+// visual row band, and the 4px ROW_GAP between cards left dead gutters
+// where a tap resolved to nothing - so hit zones are NOT the visual row
+// bands. Instead, the touchable area is split at the midpoints between
+// adjacent MKH row CENTERS, and a tap resolves to the nearest of the
+// three MKH rows (full width - Amendment A specifies no horizontal
+// restriction). This also means taps on the header/XWC/UPTIME areas -
+// which have no other interactive purpose in this UI - resolve to
+// whichever MKH row is nearest, rather than being dead zones.
+//
+// Row centers (see rowTop(), ROW_H=36, ROW_GAP=4, ROW_START_Y=32):
+//   MKH1 (ROW_MKH0, idx=1): center y = 90
+//   MKH2 (ROW_MKH1, idx=2): center y = 130
+//   MKH3 (ROW_MKH2, idx=3): center y = 170
+// Zone boundaries = midpoints between adjacent centers:
+//   midpoint(90,130) = 110, midpoint(130,170) = 150
+// Resulting zones (device_id is the MK6 protocol device slot 0..2):
+//   y < 110           -> MKH 1 (device 0)
+//   110 <= y < 150    -> MKH 2 (device 1)
+//   y >= 150          -> MKH 3 (device 2)
+static const int16_t MKH_ZONE_1_2_BOUNDARY_Y = 110;
+static const int16_t MKH_ZONE_2_3_BOUNDARY_Y = 150;
+
+static int touchYToDeviceId(int16_t displayY) {
+    if (displayY < MKH_ZONE_1_2_BOUNDARY_Y)
+        return 0;
+    if (displayY < MKH_ZONE_2_3_BOUNDARY_Y)
+        return 1;
+    return 2;
+}
+
+// ~200ms min between accepted taps on the SAME row (WO9 Step 1), tracked
+// per device so rapid taps on different rows are never cross-debounced.
+static const uint32_t MKH_TOGGLE_DEBOUNCE_MS = 200;
+static uint32_t lastToggleMs[MKH_MK6_NUM_DEVICES] = {0, 0, 0};
+
 // Arduino loop function. Runs in CPU 1.
 void loop() {
     // This call fetches all the controllers' data.
@@ -653,9 +800,59 @@ void loop() {
     if (dataUpdated)
         processControllers();
 
-    // v0.9.0 Step 0: touch bring-up proof only - logs events, no
-    // dashboard interaction yet (that's Step 1, on explicit PM go).
-    mkh_touch_poll();
+    // v0.9.0 Step 1 (PM feedback pass): hit-test any fresh tap to its
+    // nearest MKH row, then dispatch the toggle. mkh_broadcast_toggle_
+    // off()/_on() own the full safety-ordered sequencing underneath
+    // (see mkh_broadcast.c) - this is just hit-testing, guarding, and
+    // requesting.
+    //
+    // Guard order: transition lockout FIRST (the real double-tap
+    // guard - mkh_broadcast_is_transitioning() is true from the moment
+    // a toggle is accepted until its sequence actually completes; a tap
+    // on a row mid-sequence is ignored and logged, not queued), then
+    // the ~200ms debounce on top of that as a secondary guard.
+    int16_t touchX, touchY;
+    if (mkh_touch_poll(&touchX, &touchY)) {
+        int deviceId = touchYToDeviceId(touchY);
+        uint32_t now = millis();
+
+        if (mkh_broadcast_is_transitioning(deviceId)) {
+            Console.printf(
+                "MK1 Touch: tap display=(x=%d,y=%d) -> MKH row device=%d, ignored - transition in progress\n",
+                touchX, touchY, deviceId);
+        } else if (now - lastToggleMs[deviceId] >= MKH_TOGGLE_DEBOUNCE_MS) {
+            lastToggleMs[deviceId] = now;
+            int rowIdx = ROW_MKH0 + deviceId;
+            if (mkh_hub_broadcasting[deviceId]) {
+                Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> MKH row device=%d, toggle OFF requested\n",
+                                touchX, touchY, deviceId);
+                mkh_broadcast_toggle_off(deviceId);
+                // Commanded-state semantics (WO9 PM decision): animate
+                // immediately on tap acceptance, not on completion. The
+                // neutral-then-drop sequence keeps running underneath,
+                // unaffected by (and not waited on by) this draw call -
+                // see animateToggleSwitch()'s own doc comment for the
+                // contrast with the XWC dot's observed-state semantics.
+                animateToggleSwitch(rowIdx, false);
+            } else {
+                Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> MKH row device=%d, toggle ON requested\n",
+                                touchX, touchY, deviceId);
+                mkh_broadcast_toggle_on(deviceId);
+                // Same immediate-commanded-state animation as OFF,
+                // EXCEPT for a parked device (the third hub - see
+                // MKH_TIME_SLICE_NUM_DEVICES in mkh_broadcast.c), which
+                // toggle_on() refuses outright (never enters the
+                // transitioning state, so this check runs the very next
+                // instant): check the actual resulting state rather
+                // than assuming success, so a tap on a parked row
+                // correctly stays red/off instead of animating to a
+                // green state that was never true.
+                if (mkh_hub_broadcasting[deviceId]) {
+                    animateToggleSwitch(rowIdx, true);
+                }
+            }
+        }
+    }
 
     updateDashboard();
 

@@ -65,6 +65,14 @@ void mkh_config_parse_line(const char* raw_line);
 void mkh_config_note_source(bool from_file);
 bool mkh_config_source_is_file(void);
 
+// v0.9.0 Step 1: count of lines skipped due to malformed content during
+// the most recent parse (reset by mkh_config_set_defaults()). Drives
+// the dashboard's degraded CFG:FS! state - CFG:FS means the file parsed
+// with zero skipped lines, CFG:FS! means it parsed but at least one
+// line was rejected (see mkh_config_log_table()'s per-line "skipped"
+// warnings for which).
+int mkh_config_get_skipped_line_count(void);
+
 // Logs the fully resolved table: every device/port slot, its resolved
 // value, and whether that value came from the file or a default.
 void mkh_config_log_table(void);

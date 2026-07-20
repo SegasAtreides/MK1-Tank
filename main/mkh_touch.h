@@ -9,6 +9,9 @@
 #ifndef MKH_TOUCH_H
 #define MKH_TOUCH_H
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -17,9 +20,17 @@ extern "C" {
 // address. Call once from setup(). Logs the result; never aborts boot.
 void mkh_touch_init(void);
 
-// Polls TP_INT and, if asserted, reads and logs one touch event. Call
-// once per loop() iteration. No-op if mkh_touch_init() didn't succeed.
-void mkh_touch_poll(void);
+// Polls TP_INT and, if asserted, reads and logs one touch event (every
+// PRESS/RELEASE/MOVE, unconditionally - unchanged from Step 0). Call
+// once per loop() iteration. No-op (returns false) if mkh_touch_init()
+// didn't succeed.
+//
+// v0.9.0 Step 1: also returns true, with *outDisplayX/*outDisplayY set,
+// exactly on the loop() iteration a NEW press begins (a rising edge -
+// finger-down only, not held/moved/released) - callers use this to
+// hit-test and act on a discrete tap without re-triggering on every
+// poll while a finger stays down.
+bool mkh_touch_poll(int16_t* outDisplayX, int16_t* outDisplayY);
 
 #ifdef __cplusplus
 }
