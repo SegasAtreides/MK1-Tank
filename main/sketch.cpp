@@ -14,6 +14,7 @@
 #include "mkh_config.h"
 #include "mkh_ports.h"
 #include "mkh_storage.h"
+#include "mkh_touch.h"
 
 //
 // Display (Waveshare ESP32-S3-Touch-LCD-2, ST7789 over SPI)
@@ -602,6 +603,12 @@ void setup() {
     // setup() to preserve the single-entry-point boot discipline.
     mkh_storage_boot_read();
 
+    // v0.9.0 Step 0: CST816D touch bring-up. Independent I2C bus (SDA=48,
+    // SCL=47) - no contention with the display's SPI bus, so ordering
+    // relative to initDisplay() below doesn't matter for bus-sharing
+    // reasons; placed here to group peripheral bring-up together.
+    mkh_touch_init();
+
     initDisplay();
 
     Console.printf("Firmware: %s\n", BP32.firmwareVersion());
@@ -645,6 +652,10 @@ void loop() {
     bool dataUpdated = BP32.update();
     if (dataUpdated)
         processControllers();
+
+    // v0.9.0 Step 0: touch bring-up proof only - logs events, no
+    // dashboard interaction yet (that's Step 1, on explicit PM go).
+    mkh_touch_poll();
 
     updateDashboard();
 
