@@ -81,6 +81,18 @@ static void initMkhLabels() {
 static uint16_t lastXwcColorDrawn = 0xFFFF;
 static uint32_t lastUptimeDrawnSec = 0xFFFFFFFF;
 
+// WO10 Step 0: page-switching skeleton. currentPage gates both what
+// loop() renders and how it dispatches touch - see goToPage() and
+// loop() below. Nothing in the broadcast/slicer/failsafe/XWC path
+// reads this: those aren't driven from loop() at all (mkh_broadcast's
+// service timer is independent, and BP32.update()/processControllers()
+// below run unconditionally every loop() iteration regardless of page),
+// so page state is structurally invisible to them, not just
+// by-convention invisible. Boots on PAGE_DASHBOARD, matching v0.9.0
+// behavior exactly until a page switch is requested.
+enum UiPage { PAGE_DASHBOARD = 0, PAGE_EDIT_SELECT, PAGE_EDIT_CAPTURE, PAGE_EDIT_SETTINGS, PAGE_COUNT };
+static UiPage currentPage = PAGE_DASHBOARD;
+
 static int16_t rowTop(int idx) {
     return ROW_START_Y + idx * (ROW_H + ROW_GAP);
 }
@@ -122,6 +134,29 @@ static void drawHeader() {
     int16_t cfgX = SCR_W - ROW_MARGIN - textWidth(cfgLabel, 1);
     display->setCursor(cfgX, (HEADER_H - 8) / 2);
     display->print(cfgLabel);
+}
+
+// WO10 Step 0: settings button, header corner. Carves a small hit zone
+// out of the WO9 Amendment A full-screen MKH split (see
+// MKH_ZONE_1_2_BOUNDARY_Y below) rather than shrinking or moving any
+// MKH row boundary - loop() checks this rect FIRST, before falling
+// through to the unchanged touchYToDeviceId() split, so every pixel
+// outside this 30x24 header corner resolves exactly as it did in
+// v0.9.0. Placed left of the (centered) title, clear of both the title
+// text and the right-aligned CFG label.
+static const int16_t SETTINGS_BTN_X = 2;
+static const int16_t SETTINGS_BTN_Y = 2;
+static const int16_t SETTINGS_BTN_W = 30;
+static const int16_t SETTINGS_BTN_H = HEADER_H - 4;  // 24
+
+static void drawSettingsButton() {
+    display->fillRoundRect(SETTINGS_BTN_X, SETTINGS_BTN_Y, SETTINGS_BTN_W, SETTINGS_BTN_H, 4, COLOR_CARD_BG);
+    display->drawRoundRect(SETTINGS_BTN_X, SETTINGS_BTN_Y, SETTINGS_BTN_W, SETTINGS_BTN_H, 4, COLOR_CARD_BORDER);
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(1);
+    int16_t tx = SETTINGS_BTN_X + (SETTINGS_BTN_W - textWidth("SET", 1)) / 2;
+    display->setCursor(tx, SETTINGS_BTN_Y + (SETTINGS_BTN_H - 8) / 2);
+    display->print("SET");
 }
 
 static void drawCardShell(int idx) {
@@ -258,6 +293,7 @@ static void initDashboard() {
 
     display->fillScreen(COLOR_BG);
     drawHeader();
+    drawSettingsButton();
 
     for (int i = 0; i < ROW_COUNT; i++) {
         drawCardShell(i);
@@ -296,6 +332,116 @@ static void updateDashboard() {
     }
 
     drawUptime(false);
+}
+
+// WO10 Step 0: editor page placeholders. Page name + Back (+ Next, on
+// SELECT/CAPTURE only) - no editor logic, no config reads/writes. These
+// are replaced wholesale by later WO10 steps; they exist only to prove
+// the page-navigation corridor end-to-end.
+static const int16_t EDITOR_BTN_Y = 190;
+static const int16_t EDITOR_BTN_H = 40;
+static const int16_t EDITOR_BACK_X = 10;
+static const int16_t EDITOR_BACK_W = 140;
+static const int16_t EDITOR_NEXT_X = 170;
+static const int16_t EDITOR_NEXT_W = 140;
+
+static void drawEditorButton(int16_t x, int16_t w, const char* label) {
+    display->fillRoundRect(x, EDITOR_BTN_Y, w, EDITOR_BTN_H, 6, COLOR_CARD_BG);
+    display->drawRoundRect(x, EDITOR_BTN_Y, w, EDITOR_BTN_H, 6, COLOR_CARD_BORDER);
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(2);
+    int16_t tx = x + (w - textWidth(label, 2)) / 2;
+    display->setCursor(tx, EDITOR_BTN_Y + (EDITOR_BTN_H - 16) / 2);
+    display->print(label);
+}
+
+static bool pageHasNext(UiPage page) {
+    return page == PAGE_EDIT_SELECT || page == PAGE_EDIT_CAPTURE;
+}
+
+static void drawEditorPlaceholder(const char* pageName, UiPage page) {
+    display->fillScreen(COLOR_BG);
+    display->setTextColor(COLOR_LABEL);
+    display->setTextSize(2);
+    int16_t x = (SCR_W - textWidth(pageName, 2)) / 2;
+    display->setCursor(x, 40);
+    display->print(pageName);
+
+    drawEditorButton(EDITOR_BACK_X, EDITOR_BACK_W, "< BACK");
+    if (pageHasNext(page)) {
+        drawEditorButton(EDITOR_NEXT_X, EDITOR_NEXT_W, "NEXT >");
+    }
+}
+
+// Sole navigation entry point (WO10 Step 0 design intent): every future
+// page type just needs an enum value, a render branch here, and a
+// dispatch branch in loop() - no other call site changes. Renders the
+// destination page immediately (full redraw - editor pages have no
+// partial-diff update path yet, unlike the dashboard's updateDashboard()).
+static void goToPage(UiPage page) {
+    currentPage = page;
+    switch (page) {
+        case PAGE_DASHBOARD:
+            initDashboard();
+            break;
+        case PAGE_EDIT_SELECT:
+            drawEditorPlaceholder("EDIT: SELECT HUB", page);
+            break;
+        case PAGE_EDIT_CAPTURE:
+            drawEditorPlaceholder("EDIT: CAPTURE INPUT", page);
+            break;
+        case PAGE_EDIT_SETTINGS:
+            drawEditorPlaceholder("EDIT: PORT SETTINGS", page);
+            break;
+        case PAGE_COUNT:
+            break;
+    }
+}
+
+static UiPage editorBackTarget(UiPage page) {
+    switch (page) {
+        case PAGE_EDIT_SELECT:
+            return PAGE_DASHBOARD;
+        case PAGE_EDIT_CAPTURE:
+            return PAGE_EDIT_SELECT;
+        case PAGE_EDIT_SETTINGS:
+            return PAGE_EDIT_CAPTURE;
+        default:
+            return PAGE_DASHBOARD;
+    }
+}
+
+static UiPage editorNextTarget(UiPage page) {
+    switch (page) {
+        case PAGE_EDIT_SELECT:
+            return PAGE_EDIT_CAPTURE;
+        case PAGE_EDIT_CAPTURE:
+            return PAGE_EDIT_SETTINGS;
+        default:
+            return page;  // no Next from SETTINGS - button isn't drawn there
+    }
+}
+
+// Editor pages' own hit zones (WO10 Step 0's "own hit zones" per page,
+// separate from the dashboard's touchYToDeviceId() split above - the
+// two are never consulted in the same tap).
+static void dispatchEditorTouch(int16_t touchX, int16_t touchY) {
+    bool inBack = touchX >= EDITOR_BACK_X && touchX < EDITOR_BACK_X + EDITOR_BACK_W && touchY >= EDITOR_BTN_Y &&
+                  touchY < EDITOR_BTN_Y + EDITOR_BTN_H;
+    bool inNext = pageHasNext(currentPage) && touchX >= EDITOR_NEXT_X && touchX < EDITOR_NEXT_X + EDITOR_NEXT_W &&
+                  touchY >= EDITOR_BTN_Y && touchY < EDITOR_BTN_Y + EDITOR_BTN_H;
+
+    if (inBack) {
+        UiPage target = editorBackTarget(currentPage);
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> editor BACK, page %d -> %d\n", touchX, touchY,
+                        currentPage, target);
+        goToPage(target);
+    } else if (inNext) {
+        UiPage target = editorNextTarget(currentPage);
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> editor NEXT, page %d -> %d\n", touchX, touchY,
+                        currentPage, target);
+        goToPage(target);
+    }
 }
 
 static void initDisplay() {
@@ -800,61 +946,85 @@ void loop() {
     if (dataUpdated)
         processControllers();
 
-    // v0.9.0 Step 1 (PM feedback pass): hit-test any fresh tap to its
-    // nearest MKH row, then dispatch the toggle. mkh_broadcast_toggle_
-    // off()/_on() own the full safety-ordered sequencing underneath
-    // (see mkh_broadcast.c) - this is just hit-testing, guarding, and
-    // requesting.
-    //
-    // Guard order: transition lockout FIRST (the real double-tap
-    // guard - mkh_broadcast_is_transitioning() is true from the moment
-    // a toggle is accepted until its sequence actually completes; a tap
-    // on a row mid-sequence is ignored and logged, not queued), then
-    // the ~200ms debounce on top of that as a secondary guard.
+    // WO10 Step 0: touch dispatch is now page-aware. The dashboard's hit
+    // zones (settings button + MKH rows, debounce, transition lockout)
+    // apply ONLY in PAGE_DASHBOARD; editor pages use dispatchEditorTouch()
+    // instead. The ISR-driven consumption side (mkh_touch_poll() itself)
+    // is untouched - only this branch on currentPage is new.
     int16_t touchX, touchY;
     if (mkh_touch_poll(&touchX, &touchY)) {
-        int deviceId = touchYToDeviceId(touchY);
-        uint32_t now = millis();
-
-        if (mkh_broadcast_is_transitioning(deviceId)) {
-            Console.printf(
-                "MK1 Touch: tap display=(x=%d,y=%d) -> MKH row device=%d, ignored - transition in progress\n",
-                touchX, touchY, deviceId);
-        } else if (now - lastToggleMs[deviceId] >= MKH_TOGGLE_DEBOUNCE_MS) {
-            lastToggleMs[deviceId] = now;
-            int rowIdx = ROW_MKH0 + deviceId;
-            if (mkh_hub_broadcasting[deviceId]) {
-                Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> MKH row device=%d, toggle OFF requested\n",
-                                touchX, touchY, deviceId);
-                mkh_broadcast_toggle_off(deviceId);
-                // Commanded-state semantics (WO9 PM decision): animate
-                // immediately on tap acceptance, not on completion. The
-                // neutral-then-drop sequence keeps running underneath,
-                // unaffected by (and not waited on by) this draw call -
-                // see animateToggleSwitch()'s own doc comment for the
-                // contrast with the XWC dot's observed-state semantics.
-                animateToggleSwitch(rowIdx, false);
+        if (currentPage == PAGE_DASHBOARD) {
+            bool inSettingsBtn = touchX >= SETTINGS_BTN_X && touchX < SETTINGS_BTN_X + SETTINGS_BTN_W &&
+                                  touchY >= SETTINGS_BTN_Y && touchY < SETTINGS_BTN_Y + SETTINGS_BTN_H;
+            if (inSettingsBtn) {
+                Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings button -> PAGE_EDIT_SELECT\n", touchX,
+                                touchY);
+                goToPage(PAGE_EDIT_SELECT);
             } else {
-                Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> MKH row device=%d, toggle ON requested\n",
-                                touchX, touchY, deviceId);
-                mkh_broadcast_toggle_on(deviceId);
-                // Same immediate-commanded-state animation as OFF,
-                // EXCEPT for a parked device (the third hub - see
-                // MKH_TIME_SLICE_NUM_DEVICES in mkh_broadcast.c), which
-                // toggle_on() refuses outright (never enters the
-                // transitioning state, so this check runs the very next
-                // instant): check the actual resulting state rather
-                // than assuming success, so a tap on a parked row
-                // correctly stays red/off instead of animating to a
-                // green state that was never true.
-                if (mkh_hub_broadcasting[deviceId]) {
-                    animateToggleSwitch(rowIdx, true);
+                // v0.9.0 Step 1 (PM feedback pass): hit-test any fresh tap to
+                // its nearest MKH row, then dispatch the toggle.
+                // mkh_broadcast_toggle_off()/_on() own the full
+                // safety-ordered sequencing underneath (see
+                // mkh_broadcast.c) - this is just hit-testing, guarding, and
+                // requesting.
+                //
+                // Guard order: transition lockout FIRST (the real
+                // double-tap guard - mkh_broadcast_is_transitioning() is
+                // true from the moment a toggle is accepted until its
+                // sequence actually completes; a tap on a row mid-sequence
+                // is ignored and logged, not queued), then the ~200ms
+                // debounce on top of that as a secondary guard.
+                int deviceId = touchYToDeviceId(touchY);
+                uint32_t now = millis();
+
+                if (mkh_broadcast_is_transitioning(deviceId)) {
+                    Console.printf(
+                        "MK1 Touch: tap display=(x=%d,y=%d) -> MKH row device=%d, ignored - transition in "
+                        "progress\n",
+                        touchX, touchY, deviceId);
+                } else if (now - lastToggleMs[deviceId] >= MKH_TOGGLE_DEBOUNCE_MS) {
+                    lastToggleMs[deviceId] = now;
+                    int rowIdx = ROW_MKH0 + deviceId;
+                    if (mkh_hub_broadcasting[deviceId]) {
+                        Console.printf(
+                            "MK1 Touch: tap display=(x=%d,y=%d) -> MKH row device=%d, toggle OFF requested\n",
+                            touchX, touchY, deviceId);
+                        mkh_broadcast_toggle_off(deviceId);
+                        // Commanded-state semantics (WO9 PM decision): animate
+                        // immediately on tap acceptance, not on completion. The
+                        // neutral-then-drop sequence keeps running underneath,
+                        // unaffected by (and not waited on by) this draw call -
+                        // see animateToggleSwitch()'s own doc comment for the
+                        // contrast with the XWC dot's observed-state semantics.
+                        animateToggleSwitch(rowIdx, false);
+                    } else {
+                        Console.printf(
+                            "MK1 Touch: tap display=(x=%d,y=%d) -> MKH row device=%d, toggle ON requested\n",
+                            touchX, touchY, deviceId);
+                        mkh_broadcast_toggle_on(deviceId);
+                        // Same immediate-commanded-state animation as OFF,
+                        // EXCEPT for a parked device (the third hub - see
+                        // MKH_TIME_SLICE_NUM_DEVICES in mkh_broadcast.c), which
+                        // toggle_on() refuses outright (never enters the
+                        // transitioning state, so this check runs the very next
+                        // instant): check the actual resulting state rather
+                        // than assuming success, so a tap on a parked row
+                        // correctly stays red/off instead of animating to a
+                        // green state that was never true.
+                        if (mkh_hub_broadcasting[deviceId]) {
+                            animateToggleSwitch(rowIdx, true);
+                        }
+                    }
                 }
             }
+        } else {
+            dispatchEditorTouch(touchX, touchY);
         }
     }
 
-    updateDashboard();
+    if (currentPage == PAGE_DASHBOARD) {
+        updateDashboard();
+    }
 
     // The main loop must have some kind of "yield to lower priority task" event.
     // Otherwise, the watchdog will get triggered.
