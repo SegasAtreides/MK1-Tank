@@ -6,8 +6,31 @@ up to three Mould King Bluetooth hubs over the Mould King 6.0 (MK6) RC
 protocol. The board's touchscreen doubles as a live dashboard and an
 on-device input-mapping editor - no companion app, no PC required.
 
-![MK1-Tank - front/side view](docs/images/tank-front.jpg)
-<!-- PM: replace with an actual photo before publishing -->
+
+## Acknowledgments
+
+MK1-Tank stands on the work of others, gratefully acknowledged:
+
+- **[Bluepad32](https://github.com/ricardoquesada/bluepad32)** by Ricardo Quesada — the
+  Bluetooth gamepad library that makes the Xbox Wireless Controller link possible, and the
+  [project template](https://github.com/ricardoquesada/esp-idf-arduino-bluepad32-template)
+  this firmware was built from.
+- **[BTstack](https://github.com/bluekitchen/btstack)** by BlueKitchen — the underlying
+  Bluetooth stack.
+- **Waveshare** — for the [ESP32-S3-Touch-LCD-2](https://www.waveshare.com/wiki/ESP32-S3-Touch-LCD-2)
+  board and its documentation, schematics, and demo code.
+- The **Mould King BLE protocol** reverse-engineering work shared by the LEGO/MK hobbyist
+  community, without which no third-party controller could talk to these hubs.
+
+Full license details for third-party components are in [NOTICE](NOTICE) and [LICENSE](LICENSE).
+
+## How this project was built
+
+MK1-Tank is a human–AI collaboration: a human project manager specified, bench-tested, and
+accepted every feature, working with Claude (Anthropic) as research and implementation
+manager and Claude Code as the coding agent. Every release was verified on physical
+hardware before being tagged. The design decisions, the test rig, and the tank are human;
+the keystrokes were shared.
 
 ## What it does
 
@@ -173,10 +196,3 @@ Apache License 2.0 - see [LICENSE](LICENSE), consistent with the
 the display driver, etc.) keep their own original licenses - see
 [NOTICE](NOTICE).
 
-## Photos
-
-<!-- PM: add real photos and remove this placeholder section -->
-- [ ] Front/side view of the assembled tank
-- [ ] Touchscreen dashboard, powered on
-- [ ] On-device editor mid-capture
-- [ ] Hub mounted in the model, address LED visible
