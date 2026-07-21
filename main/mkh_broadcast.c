@@ -55,6 +55,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "mkh_ports.h"
@@ -124,16 +125,8 @@ static uint8_t mkh_channel_value[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS] = {
 };
 static SemaphoreHandle_t mkh_channel_mutex;
 
-void mkh_set_channel(int device_id, int port, uint8_t value) {
-    if (device_id < 0 || device_id >= MKH_MK6_NUM_DEVICES)
-        return;
-    if (port < 0 || port >= MKH_MK6_NUM_CHANNELS)
-        return;
-
-    xSemaphoreTake(mkh_channel_mutex, portMAX_DELAY);
-    mkh_channel_value[device_id][port] = value;
-    xSemaphoreGive(mkh_channel_mutex);
-}
+// mkh_set_channel() itself is defined further down (after mkh_set_adv_payload()
+// and the WO12 Phase 2 event-send machinery it now triggers) - see there.
 
 // v0.9.0 Step 1: which devices are eligible for the CONTROL rotation
 // right now. Distinct from mkh_hub_broadcasting[] (the dashboard-facing
@@ -191,6 +184,110 @@ static void mkh_set_adv_payload(const uint8_t* payload, size_t payload_len) {
     i += payload_len;
 
     gap_advertisements_set_data((uint8_t)i, mkh_adv_buf);
+}
+
+// WO12 Phase 2: shared by the periodic keep-alive path (mkh_broadcast_control())
+// and the new event-driven out-of-turn path (mkh_event_send_callback() below) -
+// builds a CONTROL telegram from the given channel values, encrypts it, and hands
+// it to the stack. Telegram content/encoding is untouched (same
+// mkh_protocol_control_telegram_neutral()/mkh_protocol_set_channel()/
+// mkh_protocol_encrypt() calls either path already made) - only which of the two
+// call sites triggers a send, and when, is new. Does NOT touch the periodic
+// timer's own bookkeeping (mkh_time_slice_last_device, the OFF-grace countdown,
+// changed-logging) - those stay exclusively owned by mkh_broadcast_control(),
+// since an event send doesn't advance the round-robin or count as one of the OFF
+// sequence's required neutral-airings (the periodic cycle's own next service
+// still airs it and does that counting, per WO9's ">=3 full cycles" contract).
+static void mkh_stage_and_send_values(int device_id, const uint8_t values[MKH_MK6_NUM_CHANNELS]) {
+    uint8_t telegram[MKH_TELEGRAM_CONTROL_LEN];
+    mkh_protocol_control_telegram_neutral(device_id, telegram);
+    for (int ch = 0; ch < MKH_MK6_NUM_CHANNELS; ch++) {
+        float power = ((float)values[ch] - 128.0f) / 128.0f;
+        mkh_protocol_set_channel(telegram, ch, power);
+    }
+
+    uint8_t payload[MKH_PAYLOAD_CONTROL_LEN];
+    size_t payload_len = mkh_protocol_encrypt(telegram, sizeof(telegram), payload, sizeof(payload));
+    mkh_set_adv_payload(payload, payload_len);
+
+    // Dashboard: this device is now (and continues to be) serviced - true
+    // broadcast state, per WO9. Set here too (not just in
+    // mkh_broadcast_control()) so an event send alone is enough to flip a
+    // freshly-toggled-on device's dashboard row green without waiting for its
+    // first periodic cycle.
+    mkh_hub_broadcasting[device_id] = true;
+}
+
+// WO12 Phase 2: event-driven immediate sends. Root cause (see the completion
+// report): the periodic ~100ms software timer was the ONLY thing that ever
+// rebuilt/restaged a telegram, so an input change could sit unsent for up to
+// one full timer period - doubled to ~200ms whenever a second hub is also in
+// the round-robin, which is the normal both-hubs-on boot state, not an edge
+// case. mkh_set_channel() below now triggers an immediate out-of-turn send the
+// moment a port's value actually changes, for any active device; the periodic
+// timer is unchanged and keeps running as a keep-alive so a value that stops
+// changing still gets re-affirmed on air.
+//
+// Rate-limited per device (not globally - each device's own telegram is
+// independent) so a wiggling/noisy stick can't flood the BLE stack; the ~20-30ms
+// floor is well above the deadzone-filtered sweep's natural output rate for a
+// single deliberate move but far below anything a human could perceive as lag.
+#define MKH_EVENT_SEND_MIN_INTERVAL_US 25000
+static int64_t mkh_last_event_send_us[MKH_MK6_NUM_DEVICES];
+
+// mkh_set_channel() runs on whichever FreeRTOS task calls processMappedInputs()
+// (the Arduino/main task, via sketch.cpp's loop()) - a different task than the
+// one running the BTstack run loop. Calling BTstack APIs (gap_advertisements_
+// set_data() et al, inside mkh_stage_and_send_values()) directly from that task
+// would not be safe - BTstack's core is single-threaded by design.
+// btstack_run_loop_execute_on_main_thread() is BTstack's documented, non-
+// deprecated mechanism for exactly this: marshal a callback onto the correct
+// thread instead of calling BTstack APIs directly from another task (see
+// btstack_run_loop.h's doc comment on the function). One registration struct
+// PER DEVICE (not one shared one) so a pending event for device 0 can never be
+// clobbered by one for device 1 racing in before the first is processed.
+static btstack_context_callback_registration_t mkh_event_callback_reg[MKH_MK6_NUM_DEVICES];
+
+static void mkh_event_send_callback(void* context) {
+    int device_id = (int)(intptr_t)context;
+    uint8_t values[MKH_MK6_NUM_CHANNELS];
+    xSemaphoreTake(mkh_channel_mutex, portMAX_DELAY);
+    memcpy(values, mkh_channel_value[device_id], sizeof(values));
+    xSemaphoreGive(mkh_channel_mutex);
+    mkh_stage_and_send_values(device_id, values);
+    logi("MK6 Broadcast: CONTROL telegram sent event-driven (device=%d)\n", device_id);
+}
+
+void mkh_set_channel(int device_id, int port, uint8_t value) {
+    if (device_id < 0 || device_id >= MKH_MK6_NUM_DEVICES)
+        return;
+    if (port < 0 || port >= MKH_MK6_NUM_CHANNELS)
+        return;
+
+    xSemaphoreTake(mkh_channel_mutex, portMAX_DELAY);
+    bool changed = mkh_channel_value[device_id][port] != value;
+    mkh_channel_value[device_id][port] = value;
+    xSemaphoreGive(mkh_channel_mutex);
+
+    // WO12 Phase 2: event-driven out-of-turn send - see the machinery above.
+    // Gated on mkh_device_active[device_id], the same flag mkh_next_active_
+    // device() uses to decide who's in the periodic rotation: processMappedInputs()
+    // (sketch.cpp) calls mkh_set_channel() for every CONFIGURED port every tick
+    // regardless of a hub's dashboard on/off state (unchanged, pre-existing
+    // behavior - config assignment and broadcast on/off are independent), so
+    // without this gate a toggled-OFF or never-activated hub would get stray
+    // event sends. A device mid-transition (mkh_device_transitioning[]) is still
+    // mkh_device_active[] and correctly still gets event sends - transitioning is
+    // a dashboard-tap debounce concept, not a broadcast-eligibility one.
+    if (changed && mkh_device_active[device_id]) {
+        int64_t now = esp_timer_get_time();
+        if (now - mkh_last_event_send_us[device_id] >= MKH_EVENT_SEND_MIN_INTERVAL_US) {
+            mkh_last_event_send_us[device_id] = now;
+            mkh_event_callback_reg[device_id].callback = mkh_event_send_callback;
+            mkh_event_callback_reg[device_id].context = (void*)(intptr_t)device_id;
+            btstack_run_loop_execute_on_main_thread(&mkh_event_callback_reg[device_id]);
+        }
+    }
 }
 
 // Last-logged snapshot per device, so the (verbose) per-telegram log only
@@ -264,6 +361,7 @@ static void mkh_broadcast_control(btstack_timer_source_t* ts) {
 
     uint8_t payload[MKH_PAYLOAD_CONTROL_LEN];
     size_t payload_len = mkh_protocol_encrypt(telegram, sizeof(telegram), payload, sizeof(payload));
+
     mkh_set_adv_payload(payload, payload_len);
 
     // Dashboard: this device is now (and continues to be) serviced by
