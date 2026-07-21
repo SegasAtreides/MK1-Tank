@@ -19,7 +19,9 @@ dependencies.lock
 dist/
 build/
 cmake-build-*/
-build/
+
+# PlatformIO build output
+.pio/
 
 # Xcode
 *.mode*v*

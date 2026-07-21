@@ -126,9 +126,18 @@ enum UiPage {
     PAGE_EDIT_PORTS,
     PAGE_EDIT_CAPTURE,
     PAGE_EDIT_SETTINGS,
+    PAGE_IDLE,  // WO11 Task 3
     PAGE_COUNT
 };
 static UiPage currentPage = PAGE_SPLASH;
+
+// WO11 Task 3: idle-screen entry timer. Updated whenever loop() sees a
+// fresh accepted tap (any page), and on every dashboard (re-)entry -
+// see initDashboard() and loop() below. Idle only triggers FROM
+// PAGE_DASHBOARD (CC's judgment: never hijack an in-progress editor
+// session just because the user paused touching the screen).
+static uint32_t lastTouchActivityMs = 0;
+static const uint32_t IDLE_TIMEOUT_MS = 30000;
 
 // WO10 Step 1: editing context - selection state only (no pending
 // values yet - that's a later step). selected_valid is the "nothing
@@ -195,6 +204,12 @@ static void clearPendingSession() {
             pendingEdits[d][p].dirty = false;
 }
 
+// WO11 Task 4 (hardening): forward-declared so pushPendingSessionToLiveTable()
+// below can clear a port's runtime latch state at push time - defined with
+// the rest of the latch-state machinery further down (see its doc comment
+// there for why).
+static void clearLatchStateForPort(int dev, int port);
+
 // Writes every dirty pending edit into the live mkh_config table - the
 // one place Test-ON and Save actually touch the live table (through
 // mkh_config_set_port(), never the protocol/broadcast layer directly).
@@ -204,6 +219,10 @@ static void pushPendingSessionToLiveTable() {
             if (pendingEdits[d][p].dirty) {
                 mkh_config_set_port(d, p, pendingEdits[d][p].input, pendingEdits[d][p].invert,
                                      pendingEdits[d][p].max_percent, pendingEdits[d][p].mode);
+                // WO11 Task 4: fresh unlatched start on every push - see
+                // clearLatchStateForPort()'s doc comment for the stale-
+                // latch-carryover bug this closes.
+                clearLatchStateForPort(d, p);
             }
         }
     }
@@ -522,6 +541,7 @@ static void drawUptime(bool force) {
 
 static void initDashboard() {
     initMkhLabels();
+    lastTouchActivityMs = millis();  // WO11 Task 3: every dashboard entry is a fresh idle countdown
 
     display->fillScreen(COLOR_BG);
     drawHeader();
@@ -664,6 +684,74 @@ static void drawSplash() {
     int16_t vx = (SCR_W - textWidth(MK1_FW_VERSION, 1)) / 2;
     display->setCursor(vx, trackY + trackH + 16);
     display->print(MK1_FW_VERSION);
+}
+
+// WO11 Task 3: idle screen. Display-layer only, by construction -
+// entry/exit are driven from loop()'s existing millis()/xwcState reads
+// (both already-read state, no new coupling to broadcast/slicer/
+// failsafe/XWC processing/config), and the animation is a small
+// periodically-redrawn region, not a full-screen redraw loop, so it
+// can't meaningfully compete with the BLE stack for cycles. Reuses
+// drawSplash()'s exact tank silhouette geometry/colors so idle and
+// splash read as "the same tank" - static tank + a small pulsing
+// "exhaust" dot near the rear suggesting an idling engine.
+static const int16_t IDLE_PUFF_CX = 100;
+static const int16_t IDLE_PUFF_CY = 140;
+static const int16_t IDLE_PUFF_MAX_R = 10;
+static const uint32_t IDLE_ANIM_INTERVAL_MS = 500;
+static uint32_t idleAnimLastTickMs = 0;
+static int idleAnimFrame = 0;
+
+static void drawIdleTank() {
+    const int16_t hullX = 110, hullY = 150, hullW = 100, hullH = 30;
+    const int16_t turretX = 140, turretY = 122, turretW = 45, turretH = 28;
+    const int16_t barrelX = turretX + turretW, barrelY = turretY + turretH / 2 - 3, barrelW = 45, barrelH = 6;
+    const int16_t trackX = 95, trackY = hullY + hullH, trackW = 130, trackH = 16;
+
+    display->fillRoundRect(hullX, hullY, hullW, hullH, 4, COLOR_TANK);
+    display->fillRoundRect(turretX, turretY, turretW, turretH, 4, COLOR_TANK);
+    display->fillRect(barrelX, barrelY, barrelW, barrelH, COLOR_TANK);
+    display->fillRoundRect(trackX, trackY, trackW, trackH, 4, COLOR_TANK);
+    for (int i = 0; i < 5; i++) {
+        int16_t wx = trackX + 14 + i * ((trackW - 28) / 4);
+        display->fillCircle(wx, trackY + trackH / 2, 6, COLOR_WHEEL);
+    }
+}
+
+// One small localized redraw per animation tick - erase the puff's max
+// footprint, draw this frame's dot. Never touches more than a ~22x22px
+// region, regardless of how long idle holds.
+static void drawIdlePuffFrame(int frame) {
+    display->fillCircle(IDLE_PUFF_CX, IDLE_PUFF_CY, IDLE_PUFF_MAX_R + 1, COLOR_BG);
+    int16_t r = 3 + (frame % 4) * 2;  // 3,5,7,9 cycling - a "puff" that grows then resets
+    uint8_t shade = (uint8_t)(70 + frame * 15);
+    display->fillCircle(IDLE_PUFF_CX, IDLE_PUFF_CY, r, RGB565(shade, shade, shade));
+}
+
+static void drawIdlePage() {
+    display->fillScreen(COLOR_BG);
+    const char* title = "IDLE";
+    display->setTextColor(COLOR_CARD_BORDER);
+    display->setTextSize(2);
+    display->setCursor((SCR_W - textWidth(title, 2)) / 2, 20);
+    display->print(title);
+    drawIdleTank();
+    idleAnimFrame = 0;
+    idleAnimLastTickMs = millis();
+    drawIdlePuffFrame(idleAnimFrame);
+}
+
+// Called from loop() only while currentPage == PAGE_IDLE. Cheap - a
+// millis() comparison every tick, a small redraw only every
+// IDLE_ANIM_INTERVAL_MS (500ms), matching the order's "lightweight,
+// don't starve the BLE stack" constraint.
+static void updateIdleAnimation() {
+    uint32_t now = millis();
+    if (now - idleAnimLastTickMs < IDLE_ANIM_INTERVAL_MS)
+        return;
+    idleAnimLastTickMs = now;
+    idleAnimFrame = (idleAnimFrame + 1) % 4;
+    drawIdlePuffFrame(idleAnimFrame);
 }
 
 // WO11: stats page. One line per item, values sampled at render time
@@ -1196,20 +1284,24 @@ static uint8_t settingsBaselineMax = 100;
 static mkh_input_mode_t settingsBaselineMode = MKH_MODE_PROPORTIONAL;
 static bool settingsPromptActive = false;
 
+// WO11 Task 2 (settings-page polish): INVERT and MODE combined onto one
+// 40px row (left/right split at SPAGE_TOGGLE_MID_X), and the MAX label
+// folded into the slider's own 40px band - both were 28px-tall separate
+// rows before, short of the order's 40px minimum (flagged in the
+// WO10-FINAL rev B report). Combining rows rather than shrinking gaps
+// elsewhere keeps every remaining gap comfortable within the same
+// 240px page.
 static const int16_t SPAGE_INPUT_Y = 26;
-static const int16_t SPAGE_INVERT_HIT_Y = 44;
-static const int16_t SPAGE_INVERT_HIT_H = 28;
-static const int16_t SPAGE_INVERT_TRACK_X = 200;
-static const int16_t SPAGE_MODE_HIT_Y = 74;
-static const int16_t SPAGE_MODE_HIT_H = 28;
-static const int16_t SPAGE_MAX_LABEL_Y = 106;
+static const int16_t SPAGE_TOGGLE_ROW_Y = 46;
+static const int16_t SPAGE_TOGGLE_ROW_H = 40;  // meets the 40px minimum
+static const int16_t SPAGE_TOGGLE_MID_X = 160;  // left = invert, right = mode
+static const int16_t SPAGE_INVERT_TRACK_X = 14;  // relative to x=0, left half only
+static const int16_t SPAGE_MAXSLIDER_Y = 90;
+static const int16_t SPAGE_MAXSLIDER_H = 40;  // meets the 40px minimum; label lives inside this same band
 static const int16_t SPAGE_SLIDER_X = 20;         // left edge 20, 20px from screen edge (0)
 static const int16_t SPAGE_SLIDER_W = 280;         // right edge 300, 20px from screen edge (320)
-static const int16_t SPAGE_SLIDER_HIT_Y = 124;
-static const int16_t SPAGE_SLIDER_HIT_H = 40;        // short dimension - exactly the 40px minimum
-static const int16_t SPAGE_SLIDER_TRACK_Y = 138;      // thinner visual track, centered in the hit band
 static const int16_t SPAGE_SLIDER_TRACK_H = 12;
-static const int16_t SPAGE_CURVE_Y = 168;
+static const int16_t SPAGE_CURVE_Y = 134;
 
 static const int16_t SPAGE_BACK_X = 20;
 static const int16_t SPAGE_RESET_X = 120;
@@ -1219,10 +1311,11 @@ static const int16_t SPAGE_BTN_Y = 180;
 static const int16_t SPAGE_BTN_H = 40;  // bottom=220, 20px from screen edge (240)
 
 static void drawSettingsInvertRow() {
-    display->fillRect(0, SPAGE_INVERT_HIT_Y, SCR_W, SPAGE_INVERT_HIT_H, COLOR_BG);
+    display->fillRect(0, SPAGE_TOGGLE_ROW_Y, SPAGE_TOGGLE_MID_X, SPAGE_TOGGLE_ROW_H, COLOR_BG);
+    display->drawRect(4, SPAGE_TOGGLE_ROW_Y + 2, SPAGE_TOGGLE_MID_X - 8, SPAGE_TOGGLE_ROW_H - 4, COLOR_CARD_BORDER);
     display->setTextColor(COLOR_LABEL);
     display->setTextSize(1);
-    display->setCursor(20, SPAGE_INVERT_HIT_Y + (SPAGE_INVERT_HIT_H - 8) / 2);
+    display->setCursor(SPAGE_INVERT_TRACK_X, SPAGE_TOGGLE_ROW_Y + 6);
     display->print("INVERT");
 
     // Same pill-track+knob visual style as the dashboard's MKH switches
@@ -1230,7 +1323,7 @@ static void drawSettingsInvertRow() {
     // small parallel function rather than a refactor of the dashboard's
     // own rowTop()-tied drawToggleSwitch(), to avoid touching dashboard-
     // critical rendering code for an unrelated page.
-    int16_t trackTop = SPAGE_INVERT_HIT_Y + (SPAGE_INVERT_HIT_H - SWITCH_TRACK_H) / 2;
+    int16_t trackTop = SPAGE_TOGGLE_ROW_Y + SPAGE_TOGGLE_ROW_H - SWITCH_TRACK_H - 8;
     int16_t knobCy = trackTop + SWITCH_TRACK_H / 2;
     int16_t knobCx = settingsWorkingInvert ? (SPAGE_INVERT_TRACK_X + SWITCH_TRACK_W - SWITCH_KNOB_R - SWITCH_PAD)
                                             : (SPAGE_INVERT_TRACK_X + SWITCH_KNOB_R + SWITCH_PAD);
@@ -1282,33 +1375,36 @@ static mkh_input_mode_t nextModeFor(mkh_input_class_t cls, mkh_input_mode_t curr
 // entirely for MKH_INPUT_CLASS_AXIS ports - "no mode" is represented by
 // the row simply not existing, not a disabled-but-visible state.
 static void drawSettingsModeRow() {
-    display->fillRect(0, SPAGE_MODE_HIT_Y, SCR_W, SPAGE_MODE_HIT_H, COLOR_BG);
+    int16_t x = SPAGE_TOGGLE_MID_X;
+    int16_t w = SCR_W - SPAGE_TOGGLE_MID_X;
+    display->fillRect(x, SPAGE_TOGGLE_ROW_Y, w, SPAGE_TOGGLE_ROW_H, COLOR_BG);
     if (mkh_config_input_class(editCtx.captured_input) == MKH_INPUT_CLASS_AXIS) {
-        return;
+        return;  // hidden entirely for stick axes - "no mode" is the row not existing
     }
     char line[24];
     snprintf(line, sizeof(line), "MODE: %s", modeShortLabel(settingsWorkingMode));
-    display->drawRect(4, SPAGE_MODE_HIT_Y + 2, SCR_W - 8, SPAGE_MODE_HIT_H - 4, COLOR_CARD_BORDER);
+    display->drawRect(x + 4, SPAGE_TOGGLE_ROW_Y + 2, w - 8, SPAGE_TOGGLE_ROW_H - 4, COLOR_CARD_BORDER);
     display->setTextColor(COLOR_LABEL);
     display->setTextSize(1);
-    display->setCursor(20, SPAGE_MODE_HIT_Y + (SPAGE_MODE_HIT_H - 8) / 2);
+    display->setCursor(x + 10, SPAGE_TOGGLE_ROW_Y + (SPAGE_TOGGLE_ROW_H - 8) / 2);
     display->print(line);
 }
 
 static void drawSettingsMaxRow() {
-    display->fillRect(0, SPAGE_MAX_LABEL_Y - 2, SCR_W, 20, COLOR_BG);
+    display->fillRect(0, SPAGE_MAXSLIDER_Y, SCR_W, SPAGE_MAXSLIDER_H, COLOR_BG);
     char label[16];
     snprintf(label, sizeof(label), "MAX: %u%%", (unsigned)settingsWorkingMax);
     display->setTextColor(COLOR_LABEL);
-    display->setTextSize(2);
-    display->setCursor(20, SPAGE_MAX_LABEL_Y);
+    display->setTextSize(1);
+    display->setCursor(SPAGE_SLIDER_X, SPAGE_MAXSLIDER_Y);
     display->print(label);
 
-    display->fillRect(SPAGE_SLIDER_X, SPAGE_SLIDER_TRACK_Y, SPAGE_SLIDER_W, SPAGE_SLIDER_TRACK_H, COLOR_CARD_BG);
-    display->drawRect(SPAGE_SLIDER_X, SPAGE_SLIDER_TRACK_Y, SPAGE_SLIDER_W, SPAGE_SLIDER_TRACK_H, COLOR_CARD_BORDER);
+    int16_t trackY = SPAGE_MAXSLIDER_Y + 20;
+    display->fillRect(SPAGE_SLIDER_X, trackY, SPAGE_SLIDER_W, SPAGE_SLIDER_TRACK_H, COLOR_CARD_BG);
+    display->drawRect(SPAGE_SLIDER_X, trackY, SPAGE_SLIDER_W, SPAGE_SLIDER_TRACK_H, COLOR_CARD_BORDER);
     int16_t fillW = (int16_t)(((int32_t)SPAGE_SLIDER_W * settingsWorkingMax) / 100);
     if (fillW > 0) {
-        display->fillRect(SPAGE_SLIDER_X, SPAGE_SLIDER_TRACK_Y, fillW, SPAGE_SLIDER_TRACK_H, COLOR_GREEN);
+        display->fillRect(SPAGE_SLIDER_X, trackY, fillW, SPAGE_SLIDER_TRACK_H, COLOR_GREEN);
     }
 }
 
@@ -1381,15 +1477,22 @@ static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
                          touchY >= SPAGE_BTN_Y && touchY < SPAGE_BTN_Y + SPAGE_BTN_H;
         if (inKeep) {
             Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings prompt KEEP\n", touchX, touchY);
+            // WO11 Task 1: dirty/input are no longer guaranteed set by
+            // page entry (see goToPage()'s PAGE_EDIT_SETTINGS case) -
+            // this KEEP is itself a real, confirmed edit, so it commits
+            // the whole port explicitly, not just invert/max/mode.
+            pendingEdits[dev][port].dirty = true;
+            pendingEdits[dev][port].input = editCtx.captured_input;
             pendingEdits[dev][port].invert = settingsWorkingInvert;
             pendingEdits[dev][port].max_percent = settingsWorkingMax;
             pendingEdits[dev][port].mode = settingsWorkingMode;
             settingsPromptActive = false;
             goToPage(PAGE_EDIT_CAPTURE);
         } else if (inDiscard) {
-            // pendingEdits[dev][port] already holds the pre-visit
-            // baseline (committed on entry) - simply not overwriting it
-            // with the working scratch IS the discard.
+            // pendingEdits[dev][port] is left exactly as it was on
+            // entry (untouched here) - if entry didn't dirty it (WO11
+            // Task 1), discarding these working values just returns to
+            // that already-correct baseline, nothing to undo.
             Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings prompt DISCARD\n", touchX, touchY);
             settingsPromptActive = false;
             goToPage(PAGE_EDIT_CAPTURE);
@@ -1403,15 +1506,17 @@ static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
         return;
     }
 
-    if (touchY >= SPAGE_INVERT_HIT_Y && touchY < SPAGE_INVERT_HIT_Y + SPAGE_INVERT_HIT_H) {
+    // WO11 Task 2: INVERT (left half) and MODE (right half) now share
+    // one 40px row, split at SPAGE_TOGGLE_MID_X.
+    bool inToggleRow = touchY >= SPAGE_TOGGLE_ROW_Y && touchY < SPAGE_TOGGLE_ROW_Y + SPAGE_TOGGLE_ROW_H;
+    if (inToggleRow && touchX < SPAGE_TOGGLE_MID_X) {
         settingsWorkingInvert = !settingsWorkingInvert;
         Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings INVERT -> %s\n", touchX, touchY,
                         settingsWorkingInvert ? "yes" : "no");
         drawSettingsInvertRow();
         return;
     }
-
-    if (cls != MKH_INPUT_CLASS_AXIS && touchY >= SPAGE_MODE_HIT_Y && touchY < SPAGE_MODE_HIT_Y + SPAGE_MODE_HIT_H) {
+    if (inToggleRow && touchX >= SPAGE_TOGGLE_MID_X && cls != MKH_INPUT_CLASS_AXIS) {
         settingsWorkingMode = nextModeFor(cls, settingsWorkingMode);
         Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings MODE -> %s\n", touchX, touchY,
                         modeShortLabel(settingsWorkingMode));
@@ -1419,8 +1524,8 @@ static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
         return;
     }
 
-    if (touchX >= SPAGE_SLIDER_X && touchX < SPAGE_SLIDER_X + SPAGE_SLIDER_W && touchY >= SPAGE_SLIDER_HIT_Y &&
-        touchY < SPAGE_SLIDER_HIT_Y + SPAGE_SLIDER_HIT_H) {
+    if (touchX >= SPAGE_SLIDER_X && touchX < SPAGE_SLIDER_X + SPAGE_SLIDER_W && touchY >= SPAGE_MAXSLIDER_Y &&
+        touchY < SPAGE_MAXSLIDER_Y + SPAGE_MAXSLIDER_H) {
         int32_t rel = touchX - SPAGE_SLIDER_X;
         if (rel < 0)
             rel = 0;
@@ -1476,6 +1581,10 @@ static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
         drawSettingsPage();
     } else if (inSave) {
         Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings SAVE\n", touchX, touchY);
+        // WO11 Task 1: same as KEEP above - commit the whole port
+        // explicitly, entry no longer guarantees dirty/input are set.
+        pendingEdits[dev][port].dirty = true;
+        pendingEdits[dev][port].input = editCtx.captured_input;
         pendingEdits[dev][port].invert = settingsWorkingInvert;
         pendingEdits[dev][port].max_percent = settingsWorkingMax;
         pendingEdits[dev][port].mode = settingsWorkingMode;
@@ -1528,37 +1637,57 @@ static void goToPage(UiPage page) {
             break;
         }
         case PAGE_EDIT_SETTINGS: {
-            // WO10-FINAL: reaching settings is an implicit keep of the
-            // captured input - same precedent as capture's NEXT never
-            // prompting - so it commits into the pending session right
-            // here, on entry. Seeds invert/max/mode from any existing
-            // pending edit for this port (a revisit keeps prior
-            // tweaks), else from the currently resolved config (first
-            // visit this session); mode falls back to the type-
-            // appropriate default (mkh_config.c) if neither exists.
+            // WO11 Task 1 fix (was: WO10-FINAL unconditionally set
+            // pendingEdits[dev][port].dirty = true right here, on every
+            // entry - so merely walking capture -> settings -> Back
+            // dirtied the whole session and could trip the exit-editor
+            // prompt with nothing actually changed). Root cause: entry
+            // wrote through the SAME path a real edit does, with no
+            // comparison against what's already true for this port.
+            //
+            // Fix: compute the TRUE current baseline for this port
+            // (existing pending edit if one exists, else the resolved
+            // live config - including its INPUT, not just invert/max/
+            // mode) and only commit into the pending session if the
+            // freshly-captured input actually differs from that
+            // baseline. A same-input revisit (or a first visit that
+            // just confirms what's already configured) no longer
+            // dirties anything by itself; invert/max/mode edits still
+            // commit via their own KEEP/SAVE paths below, which now
+            // also set dirty+input explicitly rather than relying on
+            // this entry-time write.
             int dev = editCtx.selected_device;
             int port = editCtx.selected_port;
-            if (pendingEdits[dev][port].dirty) {
+            bool hadPending = pendingEdits[dev][port].dirty;
+            mkh_input_source_t baselineInput;
+            if (hadPending) {
+                baselineInput = pendingEdits[dev][port].input;
                 settingsWorkingInvert = pendingEdits[dev][port].invert;
                 settingsWorkingMax = pendingEdits[dev][port].max_percent;
                 settingsWorkingMode = pendingEdits[dev][port].mode;
             } else {
                 const mkh_port_config_t* cfg = mkh_config_get(dev, port);
+                baselineInput = cfg ? cfg->input : MKH_INPUT_NONE;
                 settingsWorkingInvert = cfg ? cfg->invert : false;
                 settingsWorkingMax = cfg ? cfg->max_percent : 100;
                 settingsWorkingMode = cfg ? cfg->mode : MKH_MODE_PROPORTIONAL;
             }
-            pendingEdits[dev][port].dirty = true;
-            pendingEdits[dev][port].input = editCtx.captured_input;
-            pendingEdits[dev][port].invert = settingsWorkingInvert;
-            pendingEdits[dev][port].max_percent = settingsWorkingMax;
-            pendingEdits[dev][port].mode = settingsWorkingMode;
+            if (editCtx.captured_input != baselineInput) {
+                pendingEdits[dev][port].dirty = true;
+                pendingEdits[dev][port].input = editCtx.captured_input;
+                pendingEdits[dev][port].invert = settingsWorkingInvert;
+                pendingEdits[dev][port].max_percent = settingsWorkingMax;
+                pendingEdits[dev][port].mode = settingsWorkingMode;
+            }
             settingsBaselineInvert = settingsWorkingInvert;
             settingsBaselineMax = settingsWorkingMax;
             settingsBaselineMode = settingsWorkingMode;
             drawSettingsPage();
             break;
         }
+        case PAGE_IDLE:
+            drawIdlePage();
+            break;
         case PAGE_COUNT:
             break;
     }
@@ -1750,10 +1879,21 @@ static uint8_t mkTriggerToChannelByte(int32_t triggerValue) {
 static bool latchState[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS];
 static bool latchPrevPressed[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS];
 
+// WO11 Task 4 (hardening): reassigning a port away from latched mode and
+// back again via the editor could otherwise resurface a stale latchState
+// value from before the reassignment - a port pushed through
+// pushPendingSessionToLiveTable() (Test-ON/Save) always gets a fresh,
+// unlatched start, same "boots off" guarantee the order gives config
+// itself. Forward-declared above (near clearEditorSession()) so
+// pushPendingSessionToLiveTable(), defined earlier in the file, can call it.
+static void clearLatchStateForPort(int dev, int port) {
+    latchState[dev][port] = false;
+    latchPrevPressed[dev][port] = false;
+}
+
 static void clearLatchStateForDevice(int dev) {
     for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++) {
-        latchState[dev][p] = false;
-        latchPrevPressed[dev][p] = false;
+        clearLatchStateForPort(dev, p);
     }
 }
 
@@ -2429,6 +2569,11 @@ void loop() {
     // dispatchEditorTouch() now only serves PAGE_EDIT_SETTINGS.
     int16_t touchX, touchY;
     if (mkh_touch_poll(&touchX, &touchY)) {
+        // WO11 Task 3: any accepted tap, on any page, resets the idle
+        // countdown - display-layer only, reads the same touch event
+        // already being dispatched below, writes nothing broadcast/
+        // slicer/failsafe/XWC-processing/config touches.
+        lastTouchActivityMs = millis();
         if (currentPage == PAGE_DASHBOARD) {
             // WO10 CLOSEOUT: hit-tested against the enlarged
             // SETTINGS_HIT_* rect, not the small SETTINGS_BTN_* visual -
@@ -2540,13 +2685,40 @@ void loop() {
             // report, rather than risk touching already-verified Step 0-2
             // code under this order's single-pass scope).
             dispatchSettingsTouch(touchX, touchY);
+        } else if (currentPage == PAGE_IDLE) {
+            // WO11 Task 3: any touch wakes instantly, straight to the
+            // dashboard - no sub-regions, matching the order's "any touch
+            // returns to dashboard instantly."
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> idle screen, waking to dashboard\n", touchX,
+                            touchY);
+            goToPage(PAGE_DASHBOARD);
         }
+    }
+
+    // WO11 Task 3: idle-entry check. Only arms FROM PAGE_DASHBOARD (CC's
+    // judgment - never hijack an in-progress editor session just because
+    // the user paused touching the screen) and only when XWC is not
+    // connected (an active controller session should never be interrupted
+    // by an idle screen). Display-layer only: reads currentPage/millis()/
+    // xwcState, all already-read elsewhere in loop(); writes nothing
+    // broadcast/slicer/failsafe/XWC-processing/config touches.
+    if (currentPage == PAGE_DASHBOARD && xwcState != XWC_ACTIVE &&
+        (millis() - lastTouchActivityMs) >= IDLE_TIMEOUT_MS) {
+        goToPage(PAGE_IDLE);
     }
 
     if (currentPage == PAGE_DASHBOARD) {
         updateDashboard();
     } else if (currentPage == PAGE_STATS) {
         updateStatsUptime();
+    } else if (currentPage == PAGE_IDLE) {
+        // WO11 Task 3: lightweight periodic redraw (see
+        // updateIdleAnimation()'s doc comment) plus the XWC-connect wake -
+        // "if XWC connects while idling, wake to dashboard."
+        updateIdleAnimation();
+        if (xwcState == XWC_ACTIVE) {
+            goToPage(PAGE_DASHBOARD);
+        }
     } else if (currentPage == PAGE_EDIT_CAPTURE && !capturePromptActive) {
         // WO10 Step 2: capture-token detection runs every tick while
         // sitting on the capture page - but not while the leave-page

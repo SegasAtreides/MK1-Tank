@@ -1,0 +1,51 @@
+MK1-Tank third-party notices
+=============================
+
+This project is built on the esp-idf-arduino-bluepad32-template
+(https://github.com/ricardoquesada/esp-idf-arduino-bluepad32-template) by
+Ricardo Quesada, and pulls in the following third-party components. Each
+keeps its own original license; this NOTICE does not relicense any of them.
+
+Bluepad32 / Bluepad32 Arduino
+    https://github.com/ricardoquesada/bluepad32
+    License: Apache-2.0 (bluepad32_arduino additionally under
+    LGPL-2.1-or-later for the parts derived from it)
+
+BTstack
+    https://github.com/bluekitchen/btstack
+    License: see https://github.com/bluekitchen/btstack/blob/master/LICENSE
+    (dual-licensed: free for open-source/non-commercial use, commercial
+    license available from BlueKitchen for closed-source use)
+
+Arduino core for ESP32 (espressif/arduino-esp32, vendored under components/arduino)
+    https://github.com/espressif/arduino-esp32
+    License: LGPL-2.1
+
+Arduino_GFX (vendored under components/Arduino_GFX)
+    https://github.com/moononournation/Arduino_GFX
+    License: BSD (Adafruit-derived graphics library, drives the
+    Waveshare board's ST7789 display)
+
+joltwallet/littlefs (esp_littlefs, managed component)
+    https://github.com/joltwallet/esp_littlefs
+    License: MIT
+    Copyright (c) 2020 Brian Pugh
+
+Espressif managed components (e.g. esp_insights, esp_rainmaker, mdns, and
+other components/managed_components pulled in via the ESP-IDF Component
+Registry)
+    https://github.com/espressif
+    License: Apache-2.0
+
+esp-idf-arduino-bluepad32-template (project this repo was forked from)
+    https://github.com/ricardoquesada/esp-idf-arduino-bluepad32-template
+    Copyright 2021 Ricardo Quesada
+    License: Apache-2.0
+
+MK1-Tank's own original code - the Mould King MK6 protocol integration
+(main/mkh_broadcast.*, main/mkh_protocol.*), the config system
+(main/mkh_config.*, main/mkh_storage.*), the touch driver
+(main/mkh_touch.*), and the on-device dashboard/editor UI
+(main/sketch.cpp) - carries its own `SPDX-License-Identifier: Apache-2.0`
+header in every file, consistent with the template it was built on top
+of. See LICENSE for how that interacts with this project's MIT default.
