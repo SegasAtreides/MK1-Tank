@@ -33,6 +33,41 @@ MK1-Tank stands on the work of others, gratefully acknowledged:
 
 Full license details for third-party components are in [NOTICE](NOTICE) and [LICENSE](LICENSE).
 
+## Why this project exists
+
+I built MK1-Tank because phone-based control of Mould King 6.0 hubs has practical
+limits — not because the apps are bad, but because they run on phones.
+
+BrickController2 did the pioneering work and proved these hubs can be driven from a
+gamepad via BLE advertising telegrams. But a phone app has to live with the phone's
+rules:
+
+- **The screen must stay on.** The hubs need a continuous telegram stream. When the
+  screen turns off or the app goes to the background, the OS can throttle or suspend
+  Bluetooth broadcasting and the model stops mid-run.
+- **Portability.** In the field you're managing a gamepad plus a phone that has to
+  stay awake, unlocked, and in range. One more battery, one more screen.
+
+MK1-Tank removes the phone. A dedicated ESP32-S3 board with its own touchscreen
+pairs directly with an Xbox Wireless Controller and broadcasts the hub telegrams
+itself. Configuration happens on the touchscreen: no phone, no PC, no cables.
+
+### Design philosophy
+
+I'm a former Program Implementation Manager at Amazon, and this build follows the
+Invent and Simplify principle: don't work around a limitation, remove the component
+that causes it.
+
+- **Remove the phone** and the screen-off problem doesn't need solving.
+- **Right-size the power:** a larger LiPo for the motor hubs, a small dedicated cell
+  for the ESP32. Each system has its own energy budget.
+- **Buy headroom, not features:** the board's QMI8658 IMU (accelerometer + gyroscope)
+  is unused for now. It's there for future turret stabilization and motion-aware
+  upgrades.
+
+Every release was specified, bench-tested, and accepted on physical hardware before
+it was tagged.
+
 ## How this project was built
 
 MK1-Tank is a human–AI collaboration: a human project manager specified, bench-tested, and
