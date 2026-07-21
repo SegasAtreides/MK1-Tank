@@ -59,7 +59,17 @@ static const char* STORAGE_PARTITION_LABEL = "storage";
 // exists purely to mark "written under the expanded rev B token/mode
 // vocabulary" for humans/future tooling reading the file - there is no
 // parser-observable distinction between the two version numbers today.
-static const char* CONFIG_SCHEMA_HEADER = "# MK1CONFIG_SCHEMA_VERSION=2\n";
+//
+// WO13: bumped 2 -> 3 for multi-binding (repeated "HUB<n>_PORT_<letter>
+// = ..." lines for the same port now accumulate into a binding list
+// instead of "last line wins" - see mkh_config_parse_line()'s doc
+// comment in mkh_config.h). Same non-break reasoning as the rev B bump:
+// a pre-v3 file has at most one line per port, which parses under the
+// v3 parser to a 1-binding port - identical resolved behavior. The bump
+// is again purely informational, marking "written under the multi-
+// binding vocabulary" for humans/future tooling; there is no parser-
+// observable distinction between v2 and v3 files today.
+static const char* CONFIG_SCHEMA_HEADER = "# MK1CONFIG_SCHEMA_VERSION=3\n";
 
 // Reproduces v0.7.0 behavior exactly - see mk1config.sample.txt for the
 // annotated format reference.

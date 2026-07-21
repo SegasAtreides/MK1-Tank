@@ -17,11 +17,14 @@ on-device input-mapping editor - no companion app, no PC required.
   advertising - no pairing needed on the hub side.
 - Full on-device mapping editor: assign any of the 18 XWC inputs (both
   sticks, both triggers, all four face buttons, both bumpers, the D-pad, and
-  both stick clicks) to any hub port, with per-port invert, output-range
-  cap, and proportional/momentary/latched mode, all from the touchscreen.
+  both stick clicks) to any hub port - each port can carry several
+  alternative bindings - with per-binding invert, output-range cap, and
+  proportional/momentary/latched mode, all from the touchscreen. A
+  confirm-gated reset-all wipes every binding back to a blank slate.
 - Config is saved to internal flash (LittleFS) and survives reboot/power loss.
-- Dashboard shows live per-hub broadcast state and XWC connection state; an
-  idle screen kicks in after 30s of no touch input with nothing connected.
+- Dashboard shows live per-hub broadcast state, XWC connection state, and
+  onboard battery voltage (good/low/critical); an idle screen kicks in
+  after 30s of no touch input with nothing connected.
 
 ## Hardware
 
@@ -80,7 +83,12 @@ boot; there's no hot-reload. The on-device editor's Save writes it out for
 you, but the format is documented here for anyone who wants to hand-edit or
 inspect it (see `mk1config.sample.txt` for a runnable annotated example).
 
-One line per hub output port:
+One line per **binding** - a port can carry up to 8 bindings (soft cap,
+raisable), each an alternative way to reach that port ("bind several
+controls, use them one at a time" - if you touch two at once their
+outputs sum and clamp to +/-100%, but an idle binding always contributes
+zero so the common case just works). Repeated lines for the same port
+accumulate rather than replace:
 
 ```
 HUB<n>_PORT_<letter> = <input> [invert=yes|no] [max=0-100] [curve=linear] [mode=proportional|momentary|latched]

@@ -80,17 +80,19 @@ static mkh_input_mode_t default_mode_for_input(mkh_input_source_t input) {
 void mkh_config_set_defaults(void) {
     for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++) {
         for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++) {
-            s_table[d][p].input = MKH_INPUT_NONE;
-            s_table[d][p].invert = false;
-            s_table[d][p].max_percent = 100;
-            s_table[d][p].mode = MKH_MODE_PROPORTIONAL;
+            s_table[d][p].binding_count = 0;
             s_table[d][p].from_file = false;
         }
     }
     // Reproduces v0.7.0 exactly: left stick -> device 0 port A, right
-    // stick -> device 1 port A.
-    s_table[0][MKH_PORT_A].input = MKH_INPUT_LSNS;
-    s_table[1][MKH_PORT_A].input = MKH_INPUT_RSNS;
+    // stick -> device 1 port A. WO13: each is now binding[0] of a
+    // 1-binding port rather than the port's only fields.
+    s_table[0][MKH_PORT_A].bindings[0] =
+        (mkh_binding_t){.input = MKH_INPUT_LSNS, .invert = false, .max_percent = 100, .mode = MKH_MODE_PROPORTIONAL};
+    s_table[0][MKH_PORT_A].binding_count = 1;
+    s_table[1][MKH_PORT_A].bindings[0] =
+        (mkh_binding_t){.input = MKH_INPUT_RSNS, .invert = false, .max_percent = 100, .mode = MKH_MODE_PROPORTIONAL};
+    s_table[1][MKH_PORT_A].binding_count = 1;
     s_skipped_lines = 0;
 }
 
@@ -114,17 +116,21 @@ const mkh_port_config_t* mkh_config_get(int device_id, int port) {
     return &s_table[device_id][port];
 }
 
-void mkh_config_set_port(int device_id, int port, mkh_input_source_t input, bool invert, uint8_t max_percent,
-                          mkh_input_mode_t mode) {
+void mkh_config_set_port_bindings(int device_id, int port, const mkh_binding_t* bindings, int count) {
     if (device_id < 0 || device_id >= MKH_MK6_NUM_DEVICES)
         return;
     if (port < 0 || port >= MKH_MK6_NUM_CHANNELS)
         return;
-    s_table[device_id][port].input = input;
-    s_table[device_id][port].invert = invert;
-    s_table[device_id][port].max_percent = max_percent;
-    s_table[device_id][port].mode = mode;
-    s_table[device_id][port].from_file = true;
+    if (count < 0)
+        return;
+    if (count > MKH_MAX_BINDINGS_PER_PORT)
+        count = MKH_MAX_BINDINGS_PER_PORT;
+    mkh_port_config_t* cfg = &s_table[device_id][port];
+    for (int i = 0; i < count; i++) {
+        cfg->bindings[i] = bindings[i];
+    }
+    cfg->binding_count = count;
+    cfg->from_file = true;
 }
 
 static const char* input_token_name(mkh_input_source_t input) {
@@ -151,24 +157,25 @@ int mkh_config_serialize(char* buf, size_t buf_size) {
     size_t used = 0;
     for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++) {
         for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++) {
-            const mkh_port_config_t* c = &s_table[d][p];
-            if (c->input == MKH_INPUT_NONE)
-                continue;
-            int n;
-            if (mkh_config_input_class(c->input) == MKH_INPUT_CLASS_AXIS) {
-                // mode= omitted - meaningless for an axis (mkh_input_mode_t).
-                n = snprintf(buf + used, buf_size - used, "HUB%d_PORT_%c = %s invert=%s max=%u curve=linear\n",
-                             mkh_device_app_number(d), mkh_port_letter(p), input_token_name(c->input),
-                             c->invert ? "yes" : "no", (unsigned)c->max_percent);
-            } else {
-                n = snprintf(buf + used, buf_size - used,
-                             "HUB%d_PORT_%c = %s invert=%s max=%u curve=linear mode=%s\n", mkh_device_app_number(d),
-                             mkh_port_letter(p), input_token_name(c->input), c->invert ? "yes" : "no",
-                             (unsigned)c->max_percent, mode_token_name(c->mode));
+            const mkh_port_config_t* cfg = &s_table[d][p];
+            for (int i = 0; i < cfg->binding_count; i++) {
+                const mkh_binding_t* b = &cfg->bindings[i];
+                int n;
+                if (mkh_config_input_class(b->input) == MKH_INPUT_CLASS_AXIS) {
+                    // mode= omitted - meaningless for an axis (mkh_input_mode_t).
+                    n = snprintf(buf + used, buf_size - used, "HUB%d_PORT_%c = %s invert=%s max=%u curve=linear\n",
+                                 mkh_device_app_number(d), mkh_port_letter(p), input_token_name(b->input),
+                                 b->invert ? "yes" : "no", (unsigned)b->max_percent);
+                } else {
+                    n = snprintf(buf + used, buf_size - used,
+                                 "HUB%d_PORT_%c = %s invert=%s max=%u curve=linear mode=%s\n",
+                                 mkh_device_app_number(d), mkh_port_letter(p), input_token_name(b->input),
+                                 b->invert ? "yes" : "no", (unsigned)b->max_percent, mode_token_name(b->mode));
+                }
+                if (n < 0 || (size_t)n >= buf_size - used)
+                    return -1;
+                used += (size_t)n;
             }
-            if (n < 0 || (size_t)n >= buf_size - used)
-                return -1;
-            used += (size_t)n;
         }
     }
     return (int)used;
@@ -234,6 +241,16 @@ void mkh_config_parse_line(const char* raw_line) {
     int port = mkh_port_from_letter(port_letter);
     if (port < 0) {
         loge("MK1 Config: HUB%d_PORT_%c invalid port letter, line skipped\n", hub_num, port_letter);
+        s_skipped_lines++;
+        return;
+    }
+
+    // WO13: a valid line APPENDS a binding rather than replacing the
+    // port - see mkh_config_parse_line()'s doc comment in mkh_config.h.
+    // Checked before doing the (otherwise wasted) attribute parsing below.
+    if (s_table[device_id][port].binding_count >= MKH_MAX_BINDINGS_PER_PORT) {
+        loge("MK1 Config: HUB%d_PORT_%c binding cap (%d) reached, line skipped\n", hub_num, port_letter,
+             MKH_MAX_BINDINGS_PER_PORT);
         s_skipped_lines++;
         return;
     }
@@ -341,21 +358,29 @@ void mkh_config_parse_line(const char* raw_line) {
     }
     (void)mode_explicit;  // mode already defaulted above if this stayed false
 
-    s_table[device_id][port].input = input;
-    s_table[device_id][port].invert = invert;
-    s_table[device_id][port].max_percent = max_percent;
-    s_table[device_id][port].mode = mode;
-    s_table[device_id][port].from_file = true;
+    mkh_port_config_t* cfg = &s_table[device_id][port];
+    cfg->bindings[cfg->binding_count++] =
+        (mkh_binding_t){.input = input, .invert = invert, .max_percent = max_percent, .mode = mode};
+    cfg->from_file = true;
 }
 
 void mkh_config_log_table(void) {
     logi("MK1 Config: resolved mapping table (source: %s):\n", s_source_is_file ? "FILE" : "DEFAULT");
     for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++) {
         for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++) {
-            const mkh_port_config_t* c = &s_table[d][p];
-            logi("MK1 Config:   HUB%d_PORT_%c = %s invert=%s max=%u curve=linear mode=%s (source=%s)\n",
-                 mkh_device_app_number(d), mkh_port_letter(p), input_token_name(c->input), c->invert ? "yes" : "no",
-                 (unsigned)c->max_percent, mode_token_name(c->mode), c->from_file ? "file" : "default");
+            const mkh_port_config_t* cfg = &s_table[d][p];
+            if (cfg->binding_count == 0) {
+                logi("MK1 Config:   HUB%d_PORT_%c = none (source=%s)\n", mkh_device_app_number(d),
+                     mkh_port_letter(p), cfg->from_file ? "file" : "default");
+                continue;
+            }
+            for (int i = 0; i < cfg->binding_count; i++) {
+                const mkh_binding_t* b = &cfg->bindings[i];
+                logi("MK1 Config:   HUB%d_PORT_%c[%d] = %s invert=%s max=%u curve=linear mode=%s (source=%s)\n",
+                     mkh_device_app_number(d), mkh_port_letter(p), i, input_token_name(b->input),
+                     b->invert ? "yes" : "no", (unsigned)b->max_percent, mode_token_name(b->mode),
+                     cfg->from_file ? "file" : "default");
+            }
         }
     }
 }

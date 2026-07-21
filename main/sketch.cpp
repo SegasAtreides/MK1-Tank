@@ -96,6 +96,94 @@ static void initMkhLabels() {
 static uint16_t lastXwcColorDrawn = 0xFFFF;
 static uint32_t lastUptimeDrawnSec = 0xFFFFFFFF;
 
+// WO13 Task 3: battery indicator. Display-layer + one ADC read only -
+// zero contact with broadcast/slicer/failsafe/input processing, per the
+// order; nothing here is read by, or writes to, anything outside this
+// block and the two call sites in loop()/updateDashboard()/initDashboard()
+// below.
+//
+// GPIO5 verified from the OFFICIAL ESP32-S3-Touch-LCD-2 schematic
+// (Waveshare wiki's own SchDoc.pdf, "BAT" section, resistors R19/R20) -
+// deliberately not assumed from the sibling ESP32-S3-Touch-LCD-1.28
+// (round) model, which documents GPIO1 for its own battery divider;
+// GPIO1 on THIS board is already TFT_BL (see the display pin block
+// above), so carrying that sibling's pin over would have been wrong, not
+// just unverified. R19=200K (VBAT side), R20=100K (GND side) form the
+// divider, so pin voltage = VBAT * R20/(R19+R20) = VBAT/3.
+#define MKH_BATTERY_ADC_PIN 5
+static const float MKH_BATTERY_DIVIDER_RATIO = 3.0f;  // (R19+R20)/R20 = 300K/100K
+
+// Order: "slow timer (~1s or slower)".
+static const uint32_t MKH_BATTERY_READ_INTERVAL_MS = 1000;
+
+// Order: "smooth the reading (simple averaging) so the indicator doesn't
+// flicker with load spikes" - a single-state exponential moving average
+// (no sample buffer needed). alpha=0.2 settles within ~5 reads (~5s at
+// the interval above) - slow enough to reject one spiky sample under a
+// motor load transient, fast enough to still track a genuine drain
+// within a few seconds.
+static const float MKH_BATTERY_EMA_ALPHA = 0.2f;
+
+// Order's own suggested thresholds, reported as chosen, not altered:
+// ~3.7V low (a single-cell Li-ion's "getting low" knee, well above hard
+// cutoff), ~3.5V critical under load (headroom above the ~3.0-3.2V range
+// most single-cell protection circuits cut at, accounting for sag under
+// the tank's motor load and the divider/ADC's own measurement noise).
+static const float MKH_BATTERY_LOW_V = 3.7f;
+static const float MKH_BATTERY_CRITICAL_V = 3.5f;
+
+enum BatteryState { BATTERY_GOOD, BATTERY_LOW, BATTERY_CRITICAL };
+
+static float batterySmoothedV = 0.0f;
+static bool batteryHasReading = false;
+static uint32_t lastBatteryReadMs = 0;
+
+static BatteryState batteryStateFor(float volts) {
+    if (volts <= MKH_BATTERY_CRITICAL_V)
+        return BATTERY_CRITICAL;
+    if (volts <= MKH_BATTERY_LOW_V)
+        return BATTERY_LOW;
+    return BATTERY_GOOD;
+}
+
+static const char* batteryStateLabel(BatteryState s) {
+    switch (s) {
+        case BATTERY_CRITICAL:
+            return "CRITICAL";
+        case BATTERY_LOW:
+            return "LOW";
+        default:
+            return "GOOD";
+    }
+}
+
+// Called from loop() every tick, gated internally to the ~1s interval
+// above - reads the ADC, smooths it, and logs the raw+smoothed value
+// alongside the resulting state (self-test requirement: "battery ADC
+// value visible in log alongside the displayed state"). Runs regardless
+// of currentPage (a background reading, like the idle-screen timer's
+// millis() check) - only the DRAWING (drawBatteryBadge(), with the
+// dashboard's other draw calls) is dashboard-only.
+static void updateBatteryReading() {
+    uint32_t now = millis();
+    if (batteryHasReading && (now - lastBatteryReadMs < MKH_BATTERY_READ_INTERVAL_MS))
+        return;
+    lastBatteryReadMs = now;
+
+    uint32_t pinMv = analogReadMilliVolts(MKH_BATTERY_ADC_PIN);
+    float packV = (pinMv / 1000.0f) * MKH_BATTERY_DIVIDER_RATIO;
+
+    if (!batteryHasReading) {
+        batterySmoothedV = packV;  // seed on the very first sample - nothing to average against yet
+        batteryHasReading = true;
+    } else {
+        batterySmoothedV = batterySmoothedV * (1.0f - MKH_BATTERY_EMA_ALPHA) + packV * MKH_BATTERY_EMA_ALPHA;
+    }
+
+    Console.printf("MK1 Battery: pin=%lumV pack=%.2fV smoothed=%.2fV state=%s\n", (unsigned long)pinMv, packV,
+                    batterySmoothedV, batteryStateLabel(batteryStateFor(batterySmoothedV)));
+}
+
 // WO10 Step 0: page-switching skeleton. currentPage gates both what
 // loop() renders and how it dispatches touch - see goToPage() and
 // loop() below. Nothing in the broadcast/slicer/failsafe/XWC path
@@ -163,24 +251,67 @@ struct EditContext {
     bool selected_valid;                // true only once BOTH device and port are confirmed
     mkh_input_source_t captured_input;  // meaningful only once capture_valid
     bool capture_valid;                 // "nothing captured yet" sentinel, tracked separately from selected_valid
+    // WO13: which binding of the selected port the settings page is
+    // showing/editing. In range [0, binding_count-1] when viewing an
+    // existing binding (port-select's direct-to-settings entry, or
+    // Prev/Next); == binding_count (one past the end) when a capture is
+    // about to be ADDED as a brand new binding rather than replacing one.
+    int editing_binding_index;
 };
-static EditContext editCtx = {-1, -1, false, MKH_INPUT_NONE, false};
+static EditContext editCtx = {-1, -1, false, MKH_INPUT_NONE, false, 0};
 
-// WO10-FINAL: pending session - accumulates committed per-port edits
-// ACROSS ports (order requirement), independent of editCtx's single-
-// port focus. A port becomes dirty=true the moment settings is reached
-// for it (capturing the input is an implicit keep, same precedent as
-// Step 2's "NEXT never prompts") - see goToPage()'s PAGE_EDIT_SETTINGS
-// case. Never touched by mkh_config_get()/the live table directly;
-// only pushPendingSessionToLiveTable() (Test-ON, Save) writes it out.
+// WO13: which page settings' BACK (and its KEEP/DISCARD prompt) returns
+// to - true when this settings visit was reached FROM capture (a fresh
+// binding just captured, or a REPLACE/ADD choice made), matching the
+// pre-WO13 "settings always backs into capture" behavior; false when
+// reached directly from port-select to VIEW an already-occupied port's
+// existing binding(s), where there is no in-progress capture to walk
+// back into - BACK in that case returns to port-select instead. Set
+// explicitly at every goToPage(PAGE_EDIT_SETTINGS) call site rather than
+// inferred from editCtx state, to keep the two entry paths unambiguous.
+// Declared here (not with the rest of the settings-page statics further
+// down) since port-select and capture, both earlier in the file, need
+// to set it too.
+static bool settingsBackToCapture = false;
+
+// WO10-FINAL, extended WO13: pending session - accumulates committed
+// per-port edits ACROSS ports (order requirement), independent of
+// editCtx's single-port focus. A port becomes dirty=true the moment a
+// real change commits for it - see goToPage()'s PAGE_EDIT_SETTINGS case
+// and dispatchSettingsTouch()'s KEEP/SAVE handlers. Never touched by
+// mkh_config_get()/the live table directly; only
+// pushPendingSessionToLiveTable() (Test-ON, Save) writes it out.
+//
+// WO13: holds the port's WHOLE working binding list (not one binding) -
+// the same array-of-bindings shape as mkh_port_config_t, so a dirty
+// port's pendingEdits entry is the single, complete, authoritative
+// working copy for every binding on it at once (mirrors how the
+// pre-WO13 struct held the port's one binding directly).
 struct PendingPortEdit {
     bool dirty;
-    mkh_input_source_t input;
-    bool invert;
-    uint8_t max_percent;
-    mkh_input_mode_t mode;
+    mkh_binding_t bindings[MKH_MAX_BINDINGS_PER_PORT];
+    int binding_count;
 };
 static PendingPortEdit pendingEdits[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS];
+
+// WO13: resolves a port's CURRENT effective binding list - the pending
+// working copy if this session has already touched it, else the live
+// resolved table. Every read site that used to dereference
+// mkh_config_get() directly for editor purposes now goes through one of
+// these two, so "was this port touched this session" is decided in
+// exactly one place.
+static int effectiveBindingCount(int dev, int port) {
+    if (pendingEdits[dev][port].dirty)
+        return pendingEdits[dev][port].binding_count;
+    const mkh_port_config_t* cfg = mkh_config_get(dev, port);
+    return cfg ? cfg->binding_count : 0;
+}
+static mkh_binding_t effectiveBinding(int dev, int port, int idx) {
+    if (pendingEdits[dev][port].dirty)
+        return pendingEdits[dev][port].bindings[idx];
+    const mkh_port_config_t* cfg = mkh_config_get(dev, port);
+    return cfg->bindings[idx];
+}
 
 // WO10-FINAL: Test toggle, visible on every editor page (hub/port/
 // capture/settings - not the dashboard, which has its own unrelated
@@ -204,24 +335,34 @@ static void clearPendingSession() {
             pendingEdits[d][p].dirty = false;
 }
 
-// WO11 Task 4 (hardening): forward-declared so pushPendingSessionToLiveTable()
-// below can clear a port's runtime latch state at push time - defined with
-// the rest of the latch-state machinery further down (see its doc comment
-// there for why).
+// WO11 Task 4 (hardening), WO13: forward-declared so
+// pushPendingSessionToLiveTable() below can clear a port's runtime latch
+// state at push time - defined with the rest of the latch-state
+// machinery further down (see its doc comment there for why). WO13:
+// latch state is now per-BINDING (a port can have several bindings each
+// independently latchable), so this clears every binding slot on the
+// port, not just one value.
 static void clearLatchStateForPort(int dev, int port);
+// WO13 Task 4: forward-declared so dispatchHubSelectTouch()'s RESET ALL
+// confirm (defined earlier in the file than the rest of the latch-state
+// machinery) can clear every port's latch state too.
+static void clearAllLatchState();
 
 // Writes every dirty pending edit into the live mkh_config table - the
 // one place Test-ON and Save actually touch the live table (through
-// mkh_config_set_port(), never the protocol/broadcast layer directly).
+// mkh_config_set_port_bindings(), never the protocol/broadcast layer
+// directly).
 static void pushPendingSessionToLiveTable() {
     for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++) {
         for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++) {
             if (pendingEdits[d][p].dirty) {
-                mkh_config_set_port(d, p, pendingEdits[d][p].input, pendingEdits[d][p].invert,
-                                     pendingEdits[d][p].max_percent, pendingEdits[d][p].mode);
-                // WO11 Task 4: fresh unlatched start on every push - see
+                mkh_config_set_port_bindings(d, p, pendingEdits[d][p].bindings, pendingEdits[d][p].binding_count);
+                // WO11 Task 4 / WO13: fresh unlatched start on every push
+                // for EVERY binding slot on the port - see
                 // clearLatchStateForPort()'s doc comment for the stale-
-                // latch-carryover bug this closes.
+                // latch-carryover bug this closes, now generalized across
+                // bindings (a port reassigned from one latched binding to
+                // a different latched binding must not resume "on").
                 clearLatchStateForPort(d, p);
             }
         }
@@ -539,6 +680,53 @@ static void drawUptime(bool force) {
     display->print(buf);
 }
 
+// WO13 Task 3: badge sits in the UPTIME row's own middle space - the
+// row's label ("UPTIME", left) and its HH:MM:SS value (right) leave a
+// wide unused gap between them, so this needed no new row / no
+// dashboard re-layout. Purely informational (like the CFG header label
+// or the XWC status dot) - not a touch target, so the order's 40px/20px
+// interactive-target rule doesn't apply here.
+static const int16_t BATTERY_BADGE_X = 106;
+static const int16_t BATTERY_BADGE_W = 96;
+static BatteryState lastBatteryStateDrawn = BATTERY_GOOD;
+static uint32_t lastBatteryBlinkPhaseDrawn = 0xFFFFFFFF;
+
+static void drawBatteryBadge(bool force) {
+    if (!batteryHasReading)
+        return;  // first ADC read hasn't landed yet - nothing to show
+    BatteryState state = batteryStateFor(batterySmoothedV);
+    // Order: "a visible warning treatment at critical" - a blinking red
+    // background, driven purely off millis() (no new timer/coupling).
+    // Redraw on a state change, on every blink-phase flip while
+    // critical, or when forced (fresh dashboard entry).
+    uint32_t blinkPhase = (millis() / 500) % 2;
+    bool blinkChanged = (state == BATTERY_CRITICAL) && (blinkPhase != lastBatteryBlinkPhaseDrawn);
+    if (!force && state == lastBatteryStateDrawn && !blinkChanged)
+        return;
+    lastBatteryStateDrawn = state;
+    lastBatteryBlinkPhaseDrawn = blinkPhase;
+
+    int16_t y = rowTop(ROW_UPTIME);
+    uint16_t fg = COLOR_GREEN;
+    uint16_t bg = COLOR_CARD_BG;
+    if (state == BATTERY_LOW) {
+        fg = COLOR_YELLOW;
+    } else if (state == BATTERY_CRITICAL) {
+        fg = COLOR_LABEL;
+        bg = (blinkPhase == 0) ? COLOR_RED : COLOR_CARD_BG;
+    }
+
+    display->fillRect(BATTERY_BADGE_X, y + 4, BATTERY_BADGE_W, ROW_H - 8, bg);
+    display->drawRect(BATTERY_BADGE_X, y + 4, BATTERY_BADGE_W, ROW_H - 8, COLOR_CARD_BORDER);
+    char label[16];
+    snprintf(label, sizeof(label), "BAT %.1fV", batterySmoothedV);
+    display->setTextColor(fg);
+    display->setTextSize(1);
+    int16_t tx = BATTERY_BADGE_X + (BATTERY_BADGE_W - textWidth(label, 1)) / 2;
+    display->setCursor(tx, y + (ROW_H - 8) / 2);
+    display->print(label);
+}
+
 static void initDashboard() {
     initMkhLabels();
     lastTouchActivityMs = millis();  // WO11 Task 3: every dashboard entry is a fresh idle countdown
@@ -564,6 +752,7 @@ static void initDashboard() {
     }
 
     drawUptime(true);
+    drawBatteryBadge(true);
 }
 
 // Redraws only what changed since the last call. XWC's dot is the only
@@ -584,6 +773,7 @@ static void updateDashboard() {
     }
 
     drawUptime(false);
+    drawBatteryBadge(false);
 }
 
 // WO10 Step 0: editor page placeholder - PAGE_EDIT_SETTINGS only as of
@@ -840,8 +1030,13 @@ static void updateStatsUptime() {
 // margin gives (230 bottom, only 10px from the 240px screen edge) - so
 // a new, separate Back button geometry is used here instead of reusing
 // EDITOR_BACK_X/W/EDITOR_BTN_Y/H, even though it's visually similar.
-static const int16_t SELECT_BACK_X = 90;
-static const int16_t SELECT_BACK_W = 140;
+// WO13: left-aligned (was centered, X=90/W=140) - hub select's row now
+// carries a second button (RESET ALL, EXIT_PROMPT_RIGHT_X/W below,
+// unused by port select) and both pages share this same row geometry,
+// same two-button-row pattern the capture/exit-prompt overlays already
+// use. Purely a repositioning; port select's Back is otherwise unaffected.
+static const int16_t SELECT_BACK_X = 20;
+static const int16_t SELECT_BACK_W = 120;
 static const int16_t SELECT_BACK_Y = 180;
 static const int16_t SELECT_BACK_H = 40;  // bottom=220, 20px from screen edge (240)
 
@@ -854,6 +1049,9 @@ static const int16_t EXIT_PROMPT_LEFT_W = 120;
 static const int16_t EXIT_PROMPT_RIGHT_X = 180;
 static const int16_t EXIT_PROMPT_RIGHT_W = 120;
 static bool exitPromptActive = false;
+// WO13 Task 4: reset-all's own confirm prompt - see
+// drawResetAllPromptOverlay()/dispatchHubSelectTouch().
+static bool resetAllPromptActive = false;
 
 // Mirrors mkh_broadcast.c's MKH_TIME_SLICE_NUM_DEVICES (2) - the third
 // hub (device 2 / MKH3) is structurally parked project-wide (see
@@ -912,7 +1110,13 @@ static void drawHubSelect() {
     }
 
     exitPromptActive = false;
+    resetAllPromptActive = false;
     drawButtonAt(SELECT_BACK_X, SELECT_BACK_Y, SELECT_BACK_W, SELECT_BACK_H, "< BACK");
+    // WO13 Task 4: reset-all lives on hub select - the outermost editor
+    // page, same precedent as Test (a global action, not scoped to one
+    // hub/port). Shares the row's right slot with port select's (empty)
+    // right slot - see SELECT_BACK_X/W's doc comment.
+    drawButtonAt(EXIT_PROMPT_RIGHT_X, SELECT_BACK_Y, EXIT_PROMPT_RIGHT_W, SELECT_BACK_H, "RESET ALL");
     drawTestToggle();
 }
 
@@ -927,6 +1131,28 @@ static void drawExitPromptOverlay() {
     display->fillRect(0, SELECT_BACK_Y - 4, SCR_W, SELECT_BACK_H + 8, COLOR_BG);
     drawButtonAt(EXIT_PROMPT_LEFT_X, SELECT_BACK_Y, EXIT_PROMPT_LEFT_W, SELECT_BACK_H, "SAVE");
     drawButtonAt(EXIT_PROMPT_RIGHT_X, SELECT_BACK_Y, EXIT_PROMPT_RIGHT_W, SELECT_BACK_H, "DISCARD");
+}
+
+// WO13 Task 4: reset-all confirm prompt - repaints over the hub-button
+// area (same precedent drawExitPromptOverlay() above already
+// established: hub select isn't interactive while any of its prompts
+// are up, so temporarily overwriting button visuals there is fine).
+static void drawResetAllPromptOverlay() {
+    display->fillRect(0, HUB_BTN_Y0, SCR_W, SELECT_BACK_Y - HUB_BTN_Y0 - 4, COLOR_BG);
+    const char* q = "WIPE ALL BINDINGS?";
+    display->setTextColor(COLOR_RED);
+    display->setTextSize(2);
+    display->setCursor((SCR_W - textWidth(q, 2)) / 2, HUB_BTN_Y0 + 30);
+    display->print(q);
+    const char* warn = "Every port loses every binding. Saved immediately.";
+    display->setTextColor(COLOR_YELLOW);
+    display->setTextSize(1);
+    display->setCursor((SCR_W - textWidth(warn, 1)) / 2, HUB_BTN_Y0 + 60);
+    display->print(warn);
+
+    display->fillRect(0, SELECT_BACK_Y - 4, SCR_W, SELECT_BACK_H + 8, COLOR_BG);
+    drawButtonAt(EXIT_PROMPT_LEFT_X, SELECT_BACK_Y, EXIT_PROMPT_LEFT_W, SELECT_BACK_H, "CONFIRM");
+    drawButtonAt(EXIT_PROMPT_RIGHT_X, SELECT_BACK_Y, EXIT_PROMPT_RIGHT_W, SELECT_BACK_H, "CANCEL");
 }
 
 // Hub select's own hit zones - separate from dispatchEditorTouch()
@@ -952,9 +1178,50 @@ static void dispatchHubSelectTouch(int16_t touchX, int16_t touchY) {
         return;
     }
 
+    // WO13 Task 4: confirm/cancel for RESET ALL.
+    if (resetAllPromptActive) {
+        bool inConfirm = touchX >= EXIT_PROMPT_LEFT_X && touchX < EXIT_PROMPT_LEFT_X + EXIT_PROMPT_LEFT_W &&
+                         touchY >= SELECT_BACK_Y && touchY < SELECT_BACK_Y + SELECT_BACK_H;
+        bool inCancel = touchX >= EXIT_PROMPT_RIGHT_X && touchX < EXIT_PROMPT_RIGHT_X + EXIT_PROMPT_RIGHT_W &&
+                        touchY >= SELECT_BACK_Y && touchY < SELECT_BACK_Y + SELECT_BACK_H;
+        if (inConfirm) {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> RESET ALL confirmed\n", touchX, touchY);
+            // Direct to the live table and straight through the normal
+            // save path (order: "writes through the normal save path")
+            // - there is no pending-session staging step for a wipe;
+            // any pending edits from earlier in this session are
+            // superseded and dropped along with everything else.
+            for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++) {
+                for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++) {
+                    mkh_config_set_port_bindings(d, p, nullptr, 0);
+                }
+            }
+            clearAllLatchState();
+            bool ok = mkh_storage_save_config();
+            Console.printf("MK1 Editor: RESET ALL save %s\n", ok ? "succeeded" : "FAILED");
+            resetAllPromptActive = false;
+            clearEditorSession();
+            goToPage(PAGE_DASHBOARD);
+        } else if (inCancel) {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> RESET ALL cancelled\n", touchX, touchY);
+            resetAllPromptActive = false;
+            drawHubSelect();
+        }
+        return;
+    }
+
     if (testToggleHit(touchX, touchY)) {
         Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> Test toggle (hub select)\n", touchX, touchY);
         handleTestToggleTap();
+        return;
+    }
+
+    bool inResetAll = touchX >= EXIT_PROMPT_RIGHT_X && touchX < EXIT_PROMPT_RIGHT_X + EXIT_PROMPT_RIGHT_W &&
+                      touchY >= SELECT_BACK_Y && touchY < SELECT_BACK_Y + SELECT_BACK_H;
+    if (inResetAll) {
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> hub select RESET ALL, prompting\n", touchX, touchY);
+        resetAllPromptActive = true;
+        drawResetAllPromptOverlay();
         return;
     }
 
@@ -1033,13 +1300,21 @@ static void drawPortCell(int port) {
     display->setCursor(tx, y + 8);
     display->print(label);
 
-    // Optional per the order ("skip silently if not trivial" - this
-    // was): informational-only LSNS/RSNS tag for ports the mapping
-    // table already assigns. Read-only - no behavior difference, never
-    // written to.
-    const mkh_port_config_t* cfg = mkh_config_get(editCtx.selected_device, port);
-    if (cfg && cfg->input != MKH_INPUT_NONE) {
-        const char* tag = (cfg->input == MKH_INPUT_LSNS) ? "LSNS" : "RSNS";
+    // Informational-only occupied-port tag, read from the EFFECTIVE
+    // (pending-aware) binding list so it reflects this session's edits,
+    // not just the live table - never written to. WO13: generalized off
+    // the old hardcoded LSNS/RSNS-only tag (a pre-full-token-universe
+    // leftover) to show binding[0]'s real token name, plus a "+N" suffix
+    // when the port carries more than one binding.
+    int count = effectiveBindingCount(editCtx.selected_device, port);
+    if (count > 0) {
+        mkh_binding_t first = effectiveBinding(editCtx.selected_device, port, 0);
+        char tag[16];
+        if (count > 1) {
+            snprintf(tag, sizeof(tag), "%s +%d", mkh_config_input_token_name(first.input), count - 1);
+        } else {
+            snprintf(tag, sizeof(tag), "%s", mkh_config_input_token_name(first.input));
+        }
         display->setTextColor(COLOR_LABEL);
         display->setTextSize(1);
         int16_t tagX = x + (PORT_GRID_COL_W - textWidth(tag, 1)) / 2;
@@ -1097,8 +1372,6 @@ static void dispatchPortSelectTouch(int16_t touchX, int16_t touchY) {
         int16_t x = portCellX(col);
         int16_t y = portCellY(row);
         if (touchX >= x && touchX < x + PORT_GRID_COL_W && touchY >= y && touchY < y + PORT_GRID_ROW_H) {
-            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> port select MKH%d port %c -> capture\n", touchX,
-                            touchY, mkh_device_app_number(editCtx.selected_device), mkh_port_letter(p));
             // WO10 Step 2: a capture is tied to the specific port being
             // edited - re-tapping the SAME port (e.g. after KEEP
             // returned here) walks back into capture with it intact;
@@ -1111,7 +1384,30 @@ static void dispatchPortSelectTouch(int16_t touchX, int16_t touchY) {
             }
             editCtx.selected_port = p;
             editCtx.selected_valid = true;
-            goToPage(PAGE_EDIT_CAPTURE);
+
+            // WO13: an OCCUPIED port (has >=1 binding, pending-aware) goes
+            // straight to settings to VIEW/edit its existing binding(s) -
+            // capture is only the entry point for assigning a port's
+            // FIRST binding. Add binding (from settings) is the other,
+            // explicit way back into capture for an already-occupied port.
+            int count = effectiveBindingCount(editCtx.selected_device, p);
+            if (count > 0) {
+                Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> port select MKH%d port %c -> settings "
+                                "(occupied, %d binding%s)\n",
+                                touchX, touchY, mkh_device_app_number(editCtx.selected_device), mkh_port_letter(p),
+                                count, count == 1 ? "" : "s");
+                editCtx.editing_binding_index = 0;
+                mkh_binding_t first = effectiveBinding(editCtx.selected_device, p, 0);
+                editCtx.captured_input = first.input;
+                editCtx.capture_valid = true;  // real existing binding - input is never NONE here
+                settingsBackToCapture = false;
+                goToPage(PAGE_EDIT_SETTINGS);
+            } else {
+                Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> port select MKH%d port %c -> capture\n",
+                                touchX, touchY, mkh_device_app_number(editCtx.selected_device), mkh_port_letter(p));
+                editCtx.editing_binding_index = 0;
+                goToPage(PAGE_EDIT_CAPTURE);
+            }
             return;
         }
     }
@@ -1159,6 +1455,17 @@ static const int16_t CAPTURE_PROMPT_H = 30;
 // simple as hub/port select's, at the cost of this page's own dispatch
 // function needing an internal branch - contained entirely here.
 static bool capturePromptActive = false;
+
+// WO13: second in-page prompt, same pattern/rationale as
+// capturePromptActive above - shown instead of going straight to
+// settings when NEXT is tapped on an ALREADY-OCCUPIED port (the port
+// had >=1 binding, pending-aware, when capture was entered). Offers
+// REPLACE (overwrite the binding at editCtx.editing_binding_index - the
+// one that was focused when Add binding was tapped from settings) or ADD
+// (append as a brand new binding). Never shown for a fresh/unoccupied
+// port - there's nothing to replace, so NEXT goes straight to settings
+// exactly as before WO13.
+static bool captureReplaceAddPromptActive = false;
 
 static bool captureHasNext() {
     return editCtx.capture_valid;
@@ -1219,6 +1526,22 @@ static void drawCapturePromptOverlay() {
     drawButtonAt(CAPTURE_RIGHT_X, CAPTURE_BTN_Y, CAPTURE_RIGHT_W, CAPTURE_BTN_H, "DISCARD");
 }
 
+// WO13: shown instead of drawCapturePromptOverlay() when NEXT is tapped
+// on an already-occupied port - see captureReplaceAddPromptActive's doc
+// comment.
+static void drawCaptureReplaceAddOverlay() {
+    const char* q = "REPLACE OR ADD?";
+    display->fillRect(0, CAPTURE_PROMPT_Y, SCR_W, CAPTURE_PROMPT_H, COLOR_BG);
+    display->setTextColor(COLOR_YELLOW);
+    display->setTextSize(2);
+    display->setCursor((SCR_W - textWidth(q, 2)) / 2, CAPTURE_PROMPT_Y + 6);
+    display->print(q);
+
+    display->fillRect(0, CAPTURE_BTN_Y - 4, SCR_W, CAPTURE_BTN_H + 8, COLOR_BG);
+    drawButtonAt(CAPTURE_LEFT_X, CAPTURE_BTN_Y, CAPTURE_LEFT_W, CAPTURE_BTN_H, "REPLACE");
+    drawButtonAt(CAPTURE_RIGHT_X, CAPTURE_BTN_Y, CAPTURE_RIGHT_W, CAPTURE_BTN_H, "ADD");
+}
+
 // Capture page's own hit zones + the in-page prompt's, same separation
 // rationale as dispatchHubSelectTouch()/dispatchPortSelectTouch().
 static void dispatchCaptureTouch(int16_t touchX, int16_t touchY) {
@@ -1244,6 +1567,34 @@ static void dispatchCaptureTouch(int16_t touchX, int16_t touchY) {
         return;
     }
 
+    // WO13: REPLACE/ADD prompt (occupied port only) - see
+    // captureReplaceAddPromptActive's doc comment.
+    if (captureReplaceAddPromptActive) {
+        if (inLeftBtn) {
+            // REPLACE: editCtx.editing_binding_index already names the
+            // binding to overwrite (carried over from settings' Add
+            // binding tap, or 0 if capture was somehow re-entered on an
+            // occupied port) - goToPage()'s PAGE_EDIT_SETTINGS case does
+            // the actual commit using that index.
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> capture REPLACE binding[%d] -> settings\n", touchX,
+                            touchY, editCtx.editing_binding_index);
+            captureReplaceAddPromptActive = false;
+            settingsBackToCapture = true;
+            goToPage(PAGE_EDIT_SETTINGS);
+        } else if (inRightBtn) {
+            // ADD: target the next free slot (current effective count) -
+            // goToPage()'s PAGE_EDIT_SETTINGS case appends there.
+            int count = effectiveBindingCount(editCtx.selected_device, editCtx.selected_port);
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> capture ADD as binding[%d] -> settings\n", touchX,
+                            touchY, count);
+            captureReplaceAddPromptActive = false;
+            editCtx.editing_binding_index = count;
+            settingsBackToCapture = true;
+            goToPage(PAGE_EDIT_SETTINGS);
+        }
+        return;
+    }
+
     if (testToggleHit(touchX, touchY)) {
         Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> Test toggle (capture)\n", touchX, touchY);
         handleTestToggleTap();
@@ -1262,10 +1613,21 @@ static void dispatchCaptureTouch(int16_t touchX, int16_t touchY) {
             goToPage(PAGE_EDIT_PORTS);
         }
     } else if (inRightBtn && captureHasNext()) {
-        // NEXT never prompts - forward is an implicit keep (capture is
-        // already sitting in editCtx; there is nothing more to commit).
-        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> capture NEXT -> settings\n", touchX, touchY);
-        goToPage(PAGE_EDIT_SETTINGS);
+        // WO13: an occupied port offers REPLACE/ADD instead of going
+        // straight to settings - a fresh/unoccupied port behaves exactly
+        // as before (NEXT never prompts, implicit keep as binding 0).
+        int count = effectiveBindingCount(editCtx.selected_device, editCtx.selected_port);
+        if (count > 0) {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> capture NEXT, prompting (occupied port)\n", touchX,
+                            touchY);
+            captureReplaceAddPromptActive = true;
+            drawCaptureReplaceAddOverlay();
+        } else {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> capture NEXT -> settings\n", touchX, touchY);
+            editCtx.editing_binding_index = 0;
+            settingsBackToCapture = true;
+            goToPage(PAGE_EDIT_SETTINGS);
+        }
     }
 }
 
@@ -1283,6 +1645,9 @@ static bool settingsBaselineInvert = false;
 static uint8_t settingsBaselineMax = 100;
 static mkh_input_mode_t settingsBaselineMode = MKH_MODE_PROPORTIONAL;
 static bool settingsPromptActive = false;
+// settingsBackToCapture is declared earlier, alongside editCtx - see its
+// doc comment there for why (port-select and capture, both earlier in
+// the file, need to set it too).
 
 // WO11 Task 2 (settings-page polish): INVERT and MODE combined onto one
 // 40px row (left/right split at SPAGE_TOGGLE_MID_X), and the MAX label
@@ -1291,17 +1656,39 @@ static bool settingsPromptActive = false;
 // WO10-FINAL rev B report). Combining rows rather than shrinking gaps
 // elsewhere keeps every remaining gap comfortable within the same
 // 240px page.
-static const int16_t SPAGE_INPUT_Y = 26;
-static const int16_t SPAGE_TOGGLE_ROW_Y = 46;
+//
+// WO13 re-layout: fitting Add/Remove binding onto an already-full 240px
+// page (CC's judgment, reported) - the standalone "CURVE: LINEAR" line
+// is dropped (folded into the MAX row's own label instead; curve was
+// already fixed/non-selectable in v1, purely decorative) to free a full
+// 40px row, and binding Prev/Next navigation is folded into the title
+// row's own corners (arrow hit-zones extending the full 0-40px band,
+// same "hit zone may exceed the visual" precedent as the dashboard's
+// settings button) rather than claiming a row of its own. Five 40px
+// rows total, each with >=20px screen-edge margins: title/nav (0-40),
+// invert/mode (44-84), max/slider+nudge (88-128), add/remove binding
+// (132-172), back/reset/save (180-220, UNCHANGED from WO11 - still
+// 20px to the 240px bottom edge).
+static const int16_t SPAGE_NAV_Y = 0;
+static const int16_t SPAGE_NAV_H = 40;
+static const int16_t SPAGE_NAV_ARROW_W = 44;  // >= 40px minimum, flush to each screen edge
+static const int16_t SPAGE_TOGGLE_ROW_Y = 44;
 static const int16_t SPAGE_TOGGLE_ROW_H = 40;  // meets the 40px minimum
 static const int16_t SPAGE_TOGGLE_MID_X = 160;  // left = invert, right = mode
 static const int16_t SPAGE_INVERT_TRACK_X = 14;  // relative to x=0, left half only
-static const int16_t SPAGE_MAXSLIDER_Y = 90;
+static const int16_t SPAGE_MAXSLIDER_Y = 88;
 static const int16_t SPAGE_MAXSLIDER_H = 40;  // meets the 40px minimum; label lives inside this same band
-static const int16_t SPAGE_SLIDER_X = 20;         // left edge 20, 20px from screen edge (0)
-static const int16_t SPAGE_SLIDER_W = 280;         // right edge 300, 20px from screen edge (320)
+// WO13 Task 2: nudge buttons flank the slider, each a full 40x40 target
+// (short dimension >= 40px in BOTH axes, not just height) - the slider
+// track/drag zone fills the space between them.
+static const int16_t SPAGE_NUDGE_W = 40;
+static const int16_t SPAGE_NUDGE_MINUS_X = 20;   // left edge 20, 20px from screen edge (0)
+static const int16_t SPAGE_SLIDER_X = SPAGE_NUDGE_MINUS_X + SPAGE_NUDGE_W + 8;   // 68
+static const int16_t SPAGE_NUDGE_PLUS_X = 260;    // right edge 300, 20px from screen edge (320)
+static const int16_t SPAGE_SLIDER_W = SPAGE_NUDGE_PLUS_X - 8 - SPAGE_SLIDER_X;   // 184
 static const int16_t SPAGE_SLIDER_TRACK_H = 12;
-static const int16_t SPAGE_CURVE_Y = 134;
+static const int16_t SPAGE_BINDING_ACTIONS_Y = 132;
+static const int16_t SPAGE_BINDING_ACTIONS_H = 40;
 
 static const int16_t SPAGE_BACK_X = 20;
 static const int16_t SPAGE_RESET_X = 120;
@@ -1390,10 +1777,34 @@ static void drawSettingsModeRow() {
     display->print(line);
 }
 
+// WO13 Task 2: +/- nudge buttons flank the slider; a drag release within
+// 2% of either end snaps exactly to 0/100 (see applyMaxEndSnap() and its
+// use in both the drag handler and the nudge handlers below - a nudge
+// can walk INTO the snap band same as a drag can land in it).
+#define SPAGE_MAX_SNAP_BAND_PERCENT 2
+
+static uint8_t applyMaxEndSnap(int32_t percent) {
+    if (percent < 0)
+        percent = 0;
+    if (percent > 100)
+        percent = 100;
+    if (percent <= SPAGE_MAX_SNAP_BAND_PERCENT)
+        return 0;
+    if (percent >= 100 - SPAGE_MAX_SNAP_BAND_PERCENT)
+        return 100;
+    return (uint8_t)percent;
+}
+
 static void drawSettingsMaxRow() {
     display->fillRect(0, SPAGE_MAXSLIDER_Y, SCR_W, SPAGE_MAXSLIDER_H, COLOR_BG);
-    char label[16];
-    snprintf(label, sizeof(label), "MAX: %u%%", (unsigned)settingsWorkingMax);
+
+    // Nudge buttons - full 40x40 targets, same visual language as the
+    // page's other buttons (drawButtonAt: bordered box, centered label).
+    drawButtonAt(SPAGE_NUDGE_MINUS_X, SPAGE_MAXSLIDER_Y, SPAGE_NUDGE_W, SPAGE_MAXSLIDER_H, "-");
+    drawButtonAt(SPAGE_NUDGE_PLUS_X, SPAGE_MAXSLIDER_Y, SPAGE_NUDGE_W, SPAGE_MAXSLIDER_H, "+");
+
+    char label[20];
+    snprintf(label, sizeof(label), "MAX:%u%% (linear)", (unsigned)settingsWorkingMax);
     display->setTextColor(COLOR_LABEL);
     display->setTextSize(1);
     display->setCursor(SPAGE_SLIDER_X, SPAGE_MAXSLIDER_Y);
@@ -1408,6 +1819,24 @@ static void drawSettingsMaxRow() {
     }
 }
 
+// WO13 Task 1: Add binding is disabled (still drawn, but a no-op tap)
+// once the port hits MKH_MAX_BINDINGS_PER_PORT - the cap is soft/
+// raisable but still enforced here, not just in the parser. Remove
+// binding has no floor - removing the last binding leaves the port
+// unassigned, same "no exclusivity rules" simplicity as the rest of
+// Task 1.
+static void drawSettingsBindingActionsRow() {
+    display->fillRect(0, SPAGE_BINDING_ACTIONS_Y, SCR_W, SPAGE_BINDING_ACTIONS_H, COLOR_BG);
+    int dev = editCtx.selected_device;
+    int port = editCtx.selected_port;
+    int count = pendingEdits[dev][port].dirty ? pendingEdits[dev][port].binding_count
+                                               : effectiveBindingCount(dev, port);
+    bool canAdd = count < MKH_MAX_BINDINGS_PER_PORT;
+    drawButtonAt(SPAGE_BACK_X, SPAGE_BINDING_ACTIONS_Y, SPAGE_BTN_W, SPAGE_BINDING_ACTIONS_H,
+                 canAdd ? "ADD" : "ADD (MAX)");
+    drawButtonAt(SPAGE_SAVE_X, SPAGE_BINDING_ACTIONS_Y, SPAGE_BTN_W, SPAGE_BINDING_ACTIONS_H, "REMOVE");
+}
+
 static void drawSettingsButtons() {
     display->fillRect(0, SPAGE_BTN_Y - 4, SCR_W, SPAGE_BTN_H + 8, COLOR_BG);
     drawButtonAt(SPAGE_BACK_X, SPAGE_BTN_Y, SPAGE_BTN_W, SPAGE_BTN_H, "BACK");
@@ -1415,13 +1844,27 @@ static void drawSettingsButtons() {
     drawButtonAt(SPAGE_SAVE_X, SPAGE_BTN_Y, SPAGE_BTN_W, SPAGE_BTN_H, "SAVE");
 }
 
-static void drawSettingsPage() {
-    display->fillScreen(COLOR_BG);
+// WO13: title + binding Prev/Next navigation, combined into one 40px
+// band (arrow hit-zones span the full band height, "hit zone may exceed
+// the visual" - see the geometry comment above SPAGE_NAV_Y). Arrows only
+// drawn/hit-tested when the port carries more than one binding right
+// now - a single-binding port shows the plain title, same as pre-WO13.
+static void drawSettingsNavRow() {
+    display->fillRect(0, SPAGE_NAV_Y, SCR_W, SPAGE_NAV_H, COLOR_BG);
 
-    char title[32];
+    int dev = editCtx.selected_device;
+    int port = editCtx.selected_port;
+    int count = pendingEdits[dev][port].dirty ? pendingEdits[dev][port].binding_count
+                                               : effectiveBindingCount(dev, port);
+
+    char title[40];
     if (editCtx.selected_valid) {
-        snprintf(title, sizeof(title), "MKH%d - Port %c", mkh_device_app_number(editCtx.selected_device),
-                 mkh_port_letter(editCtx.selected_port));
+        if (count > 1) {
+            snprintf(title, sizeof(title), "MKH%d-%c %s (%d/%d)", mkh_device_app_number(dev), mkh_port_letter(port),
+                      mkh_config_input_token_name(editCtx.captured_input), editCtx.editing_binding_index + 1, count);
+        } else {
+            snprintf(title, sizeof(title), "MKH%d - Port %c", mkh_device_app_number(dev), mkh_port_letter(port));
+        }
     } else {
         snprintf(title, sizeof(title), "EDIT: PORT SETTINGS");
     }
@@ -1430,20 +1873,37 @@ static void drawSettingsPage() {
     display->setCursor((SCR_W - textWidth(title, 2)) / 2, 8);
     display->print(title);
 
-    char inputLine[24];
-    snprintf(inputLine, sizeof(inputLine), "INPUT: %s", mkh_config_input_token_name(editCtx.captured_input));
-    display->setTextSize(2);
-    display->setCursor(20, SPAGE_INPUT_Y);
-    display->print(inputLine);
+    if (count <= 1) {
+        // No neighbors to page through - INPUT line only, same spot the
+        // pre-WO13 single-line layout used.
+        char inputLine[24];
+        snprintf(inputLine, sizeof(inputLine), "INPUT: %s", mkh_config_input_token_name(editCtx.captured_input));
+        display->setTextSize(1);
+        display->setCursor((SCR_W - textWidth(inputLine, 1)) / 2, 28);
+        display->print(inputLine);
+        return;
+    }
 
+    display->setTextSize(2);
+    if (editCtx.editing_binding_index > 0) {
+        display->setCursor((SPAGE_NAV_ARROW_W - textWidth("<", 2)) / 2, (SPAGE_NAV_H - 16) / 2);
+        display->print("<");
+    }
+    if (editCtx.editing_binding_index < count - 1) {
+        display->setCursor(SCR_W - SPAGE_NAV_ARROW_W + (SPAGE_NAV_ARROW_W - textWidth(">", 2)) / 2,
+                            (SPAGE_NAV_H - 16) / 2);
+        display->print(">");
+    }
+}
+
+static void drawSettingsPage() {
+    display->fillScreen(COLOR_BG);
+
+    drawSettingsNavRow();
     drawSettingsInvertRow();
     drawSettingsModeRow();
     drawSettingsMaxRow();
-
-    display->setTextColor(COLOR_LABEL);
-    display->setTextSize(1);
-    display->setCursor(20, SPAGE_CURVE_Y);
-    display->print("CURVE: LINEAR");  // v1: not selectable, see mkh_config.h
+    drawSettingsBindingActionsRow();
 
     settingsPromptActive = false;
     drawSettingsButtons();
@@ -1452,10 +1912,10 @@ static void drawSettingsPage() {
 
 static void drawSettingsPromptOverlay() {
     const char* q = "KEEP CHANGES?";
-    display->fillRect(0, SPAGE_CURVE_Y - 4, SCR_W, 24, COLOR_BG);
+    display->fillRect(0, SPAGE_BINDING_ACTIONS_Y - 4, SCR_W, 24, COLOR_BG);
     display->setTextColor(COLOR_YELLOW);
     display->setTextSize(2);
-    display->setCursor((SCR_W - textWidth(q, 2)) / 2, SPAGE_CURVE_Y - 2);
+    display->setCursor((SCR_W - textWidth(q, 2)) / 2, SPAGE_BINDING_ACTIONS_Y - 2);
     display->print(q);
 
     display->fillRect(0, SPAGE_BTN_Y - 4, SCR_W, SPAGE_BTN_H + 8, COLOR_BG);
@@ -1463,12 +1923,69 @@ static void drawSettingsPromptOverlay() {
     drawButtonAt(EXIT_PROMPT_RIGHT_X, SPAGE_BTN_Y, EXIT_PROMPT_RIGHT_W, SPAGE_BTN_H, "DISCARD");
 }
 
+// WO13: lazily seeds pendingEdits[dev][port] from the live table if this
+// session hasn't touched the port yet - shared by every settings-page
+// action that needs a mutable working copy (KEEP/SAVE, Prev/Next,
+// Remove). Idempotent once dirty.
+static void settingsSeedPendingIfNeeded(int dev, int port) {
+    if (pendingEdits[dev][port].dirty)
+        return;
+    const mkh_port_config_t* cfg = mkh_config_get(dev, port);
+    pendingEdits[dev][port].binding_count = cfg ? cfg->binding_count : 0;
+    for (int i = 0; i < pendingEdits[dev][port].binding_count; i++) {
+        pendingEdits[dev][port].bindings[i] = cfg->bindings[i];
+    }
+}
+
+// WO13: commits the CURRENT binding's working invert/max/mode into the
+// pending array if they've actually changed since baseline - an
+// implicit keep, same precedent as capture's NEXT, used before Prev/Next
+// navigation so paging away from a binding never silently drops an
+// in-progress edit to it.
+static void settingsCommitWorkingIfDirty(int dev, int port, int idx) {
+    bool uncommitted = (settingsWorkingInvert != settingsBaselineInvert) ||
+                        (settingsWorkingMax != settingsBaselineMax) || (settingsWorkingMode != settingsBaselineMode);
+    if (!uncommitted)
+        return;
+    settingsSeedPendingIfNeeded(dev, port);
+    if (idx < pendingEdits[dev][port].binding_count) {
+        pendingEdits[dev][port].bindings[idx].invert = settingsWorkingInvert;
+        pendingEdits[dev][port].bindings[idx].max_percent = settingsWorkingMax;
+        pendingEdits[dev][port].bindings[idx].mode = settingsWorkingMode;
+        pendingEdits[dev][port].dirty = true;
+    }
+}
+
+// WO13: loads binding `idx` (pending-aware) into the working/baseline
+// state and redraws - used by Prev/Next. Deliberately NOT goToPage(): it
+// must not re-run the capture-commit logic in goToPage()'s
+// PAGE_EDIT_SETTINGS case, which is only for a fresh capture landing on
+// this page, not for paging between bindings already here.
+static void settingsLoadBindingAt(int dev, int port, int idx) {
+    editCtx.editing_binding_index = idx;
+    mkh_binding_t b = effectiveBinding(dev, port, idx);
+    settingsWorkingInvert = b.invert;
+    settingsWorkingMax = b.max_percent;
+    settingsWorkingMode = b.mode;
+    settingsBaselineInvert = settingsWorkingInvert;
+    settingsBaselineMax = settingsWorkingMax;
+    settingsBaselineMode = settingsWorkingMode;
+    editCtx.captured_input = b.input;
+    editCtx.capture_valid = true;
+    drawSettingsPage();
+}
+
 // Settings page's own hit zones + its leave-page prompt's, same
 // separation rationale as the other custom pages.
 static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
     int dev = editCtx.selected_device;
     int port = editCtx.selected_port;
+    int idx = editCtx.editing_binding_index;
     mkh_input_class_t cls = mkh_config_input_class(editCtx.captured_input);
+    // WO13: BACK's destination (and the KEEP/DISCARD prompt's) depends
+    // on how this settings visit was reached - see settingsBackToCapture's
+    // doc comment.
+    UiPage backTarget = settingsBackToCapture ? PAGE_EDIT_CAPTURE : PAGE_EDIT_PORTS;
 
     if (settingsPromptActive) {
         bool inKeep = touchX >= EXIT_PROMPT_LEFT_X && touchX < EXIT_PROMPT_LEFT_X + EXIT_PROMPT_LEFT_W &&
@@ -1480,14 +1997,15 @@ static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
             // WO11 Task 1: dirty/input are no longer guaranteed set by
             // page entry (see goToPage()'s PAGE_EDIT_SETTINGS case) -
             // this KEEP is itself a real, confirmed edit, so it commits
-            // the whole port explicitly, not just invert/max/mode.
-            pendingEdits[dev][port].dirty = true;
-            pendingEdits[dev][port].input = editCtx.captured_input;
-            pendingEdits[dev][port].invert = settingsWorkingInvert;
-            pendingEdits[dev][port].max_percent = settingsWorkingMax;
-            pendingEdits[dev][port].mode = settingsWorkingMode;
+            // this binding explicitly.
+            settingsSeedPendingIfNeeded(dev, port);
+            if (idx < pendingEdits[dev][port].binding_count) {
+                pendingEdits[dev][port].bindings[idx] = {editCtx.captured_input, settingsWorkingInvert,
+                                                           settingsWorkingMax, settingsWorkingMode};
+                pendingEdits[dev][port].dirty = true;
+            }
             settingsPromptActive = false;
-            goToPage(PAGE_EDIT_CAPTURE);
+            goToPage(backTarget);
         } else if (inDiscard) {
             // pendingEdits[dev][port] is left exactly as it was on
             // entry (untouched here) - if entry didn't dirty it (WO11
@@ -1495,7 +2013,7 @@ static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
             // that already-correct baseline, nothing to undo.
             Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings prompt DISCARD\n", touchX, touchY);
             settingsPromptActive = false;
-            goToPage(PAGE_EDIT_CAPTURE);
+            goToPage(backTarget);
         }
         return;
     }
@@ -1504,6 +2022,28 @@ static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
         Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> Test toggle (settings)\n", touchX, touchY);
         handleTestToggleTap();
         return;
+    }
+
+    // WO13: Prev/Next binding navigation, corners of the nav row - only
+    // live when the port carries more than one binding right now.
+    bool inNavRow = touchY >= SPAGE_NAV_Y && touchY < SPAGE_NAV_Y + SPAGE_NAV_H;
+    if (inNavRow) {
+        int count = pendingEdits[dev][port].dirty ? pendingEdits[dev][port].binding_count
+                                                   : effectiveBindingCount(dev, port);
+        if (count > 1 && touchX < SPAGE_NAV_ARROW_W && idx > 0) {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings PREV binding (%d -> %d)\n", touchX,
+                            touchY, idx, idx - 1);
+            settingsCommitWorkingIfDirty(dev, port, idx);
+            settingsLoadBindingAt(dev, port, idx - 1);
+            return;
+        }
+        if (count > 1 && touchX >= SCR_W - SPAGE_NAV_ARROW_W && idx < count - 1) {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings NEXT binding (%d -> %d)\n", touchX,
+                            touchY, idx, idx + 1);
+            settingsCommitWorkingIfDirty(dev, port, idx);
+            settingsLoadBindingAt(dev, port, idx + 1);
+            return;
+        }
     }
 
     // WO11 Task 2: INVERT (left half) and MODE (right half) now share
@@ -1524,17 +2064,80 @@ static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
         return;
     }
 
-    if (touchX >= SPAGE_SLIDER_X && touchX < SPAGE_SLIDER_X + SPAGE_SLIDER_W && touchY >= SPAGE_MAXSLIDER_Y &&
-        touchY < SPAGE_MAXSLIDER_Y + SPAGE_MAXSLIDER_H) {
+    // WO13 Task 2: nudge buttons, 1% per tap, end-snap applied same as a
+    // drag release (see applyMaxEndSnap()).
+    bool inMaxRow = touchY >= SPAGE_MAXSLIDER_Y && touchY < SPAGE_MAXSLIDER_Y + SPAGE_MAXSLIDER_H;
+    if (inMaxRow && touchX >= SPAGE_NUDGE_MINUS_X && touchX < SPAGE_NUDGE_MINUS_X + SPAGE_NUDGE_W) {
+        settingsWorkingMax = applyMaxEndSnap((int32_t)settingsWorkingMax - 1);
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings MAX nudge- -> %u%%\n", touchX, touchY,
+                        (unsigned)settingsWorkingMax);
+        drawSettingsMaxRow();
+        return;
+    }
+    if (inMaxRow && touchX >= SPAGE_NUDGE_PLUS_X && touchX < SPAGE_NUDGE_PLUS_X + SPAGE_NUDGE_W) {
+        settingsWorkingMax = applyMaxEndSnap((int32_t)settingsWorkingMax + 1);
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings MAX nudge+ -> %u%%\n", touchX, touchY,
+                        (unsigned)settingsWorkingMax);
+        drawSettingsMaxRow();
+        return;
+    }
+    if (inMaxRow && touchX >= SPAGE_SLIDER_X && touchX < SPAGE_SLIDER_X + SPAGE_SLIDER_W) {
         int32_t rel = touchX - SPAGE_SLIDER_X;
         if (rel < 0)
             rel = 0;
         if (rel > SPAGE_SLIDER_W)
             rel = SPAGE_SLIDER_W;
-        settingsWorkingMax = (uint8_t)((rel * 100) / SPAGE_SLIDER_W);
+        // WO13 Task 2: end-snap - a release within 2% of either end lands
+        // exactly on 0/100 (drag-as-is otherwise, per the order).
+        settingsWorkingMax = applyMaxEndSnap((rel * 100) / SPAGE_SLIDER_W);
         Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings MAX slider -> %u%%\n", touchX, touchY,
                         (unsigned)settingsWorkingMax);
         drawSettingsMaxRow();
+        return;
+    }
+
+    // WO13 Task 1: Add binding / Remove binding row.
+    bool inBindingActionsRow = touchY >= SPAGE_BINDING_ACTIONS_Y && touchY < SPAGE_BINDING_ACTIONS_Y + SPAGE_BINDING_ACTIONS_H;
+    bool inAddBtn = inBindingActionsRow && touchX >= SPAGE_BACK_X && touchX < SPAGE_BACK_X + SPAGE_BTN_W;
+    bool inRemoveBtn = inBindingActionsRow && touchX >= SPAGE_SAVE_X && touchX < SPAGE_SAVE_X + SPAGE_BTN_W;
+    if (inAddBtn) {
+        int count = pendingEdits[dev][port].dirty ? pendingEdits[dev][port].binding_count
+                                                   : effectiveBindingCount(dev, port);
+        if (count >= MKH_MAX_BINDINGS_PER_PORT) {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings ADD binding, ignored (cap %d reached)\n",
+                            touchX, touchY, MKH_MAX_BINDINGS_PER_PORT);
+        } else {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings ADD binding -> capture\n", touchX,
+                            touchY);
+            // editCtx.editing_binding_index is left UNCHANGED - it's the
+            // REPLACE target if capture's REPLACE/ADD prompt chooses
+            // REPLACE; ADD there computes its own fresh append index.
+            editCtx.captured_input = MKH_INPUT_NONE;
+            editCtx.capture_valid = false;
+            settingsBackToCapture = true;
+            goToPage(PAGE_EDIT_CAPTURE);
+        }
+        return;
+    }
+    if (inRemoveBtn) {
+        Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings REMOVE binding[%d]\n", touchX, touchY, idx);
+        settingsSeedPendingIfNeeded(dev, port);
+        int count = pendingEdits[dev][port].binding_count;
+        if (idx < count) {
+            for (int i = idx; i < count - 1; i++) {
+                pendingEdits[dev][port].bindings[i] = pendingEdits[dev][port].bindings[i + 1];
+            }
+            pendingEdits[dev][port].binding_count = --count;
+            pendingEdits[dev][port].dirty = true;
+        }
+        if (count == 0) {
+            // Port now unassigned - nothing left to show on this page.
+            editCtx.captured_input = MKH_INPUT_NONE;
+            editCtx.capture_valid = false;
+            goToPage(backTarget);
+        } else {
+            settingsLoadBindingAt(dev, port, idx >= count ? count - 1 : idx);
+        }
         return;
     }
 
@@ -1557,37 +2160,51 @@ static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
         } else {
             Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings BACK, silent (no uncommitted edits)\n",
                             touchX, touchY);
-            goToPage(PAGE_EDIT_CAPTURE);
+            goToPage(backTarget);
         }
     } else if (inReset) {
         // Order: "Reset (settings page) restores saved config to the
         // table and clears the session." CC's judgment (reported):
         // stays on the settings page rather than navigating away,
         // refreshing this port's fields from the just-reloaded table -
-        // a form-reset, not an exit.
+        // a form-reset, not an exit. WO13: reloads the WHOLE binding
+        // list, then re-shows binding 0 (the just-reloaded table may
+        // have fewer bindings than were being viewed).
         Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings RESET\n", touchX, touchY);
         mkh_storage_reload_config();
         clearPendingSession();
         testActive = false;
         const mkh_port_config_t* cfg = mkh_config_get(dev, port);
-        editCtx.captured_input = cfg ? cfg->input : MKH_INPUT_NONE;
-        editCtx.capture_valid = (cfg != nullptr) && (cfg->input != MKH_INPUT_NONE);
-        settingsWorkingInvert = cfg ? cfg->invert : false;
-        settingsWorkingMax = cfg ? cfg->max_percent : 100;
-        settingsWorkingMode = cfg ? cfg->mode : MKH_MODE_PROPORTIONAL;
+        if (cfg && cfg->binding_count > 0) {
+            editCtx.editing_binding_index = 0;
+            mkh_binding_t b = cfg->bindings[0];
+            editCtx.captured_input = b.input;
+            editCtx.capture_valid = true;
+            settingsWorkingInvert = b.invert;
+            settingsWorkingMax = b.max_percent;
+            settingsWorkingMode = b.mode;
+        } else {
+            editCtx.editing_binding_index = 0;
+            editCtx.captured_input = MKH_INPUT_NONE;
+            editCtx.capture_valid = false;
+            settingsWorkingInvert = false;
+            settingsWorkingMax = 100;
+            settingsWorkingMode = MKH_MODE_PROPORTIONAL;
+        }
         settingsBaselineInvert = settingsWorkingInvert;
         settingsBaselineMax = settingsWorkingMax;
         settingsBaselineMode = settingsWorkingMode;
         drawSettingsPage();
     } else if (inSave) {
         Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings SAVE\n", touchX, touchY);
-        // WO11 Task 1: same as KEEP above - commit the whole port
+        // WO11 Task 1: same as KEEP above - commit this binding
         // explicitly, entry no longer guarantees dirty/input are set.
-        pendingEdits[dev][port].dirty = true;
-        pendingEdits[dev][port].input = editCtx.captured_input;
-        pendingEdits[dev][port].invert = settingsWorkingInvert;
-        pendingEdits[dev][port].max_percent = settingsWorkingMax;
-        pendingEdits[dev][port].mode = settingsWorkingMode;
+        settingsSeedPendingIfNeeded(dev, port);
+        if (idx < pendingEdits[dev][port].binding_count) {
+            pendingEdits[dev][port].bindings[idx] = {editCtx.captured_input, settingsWorkingInvert, settingsWorkingMax,
+                                                       settingsWorkingMode};
+            pendingEdits[dev][port].dirty = true;
+        }
         performSaveAndExit();
     }
 }
@@ -1631,57 +2248,75 @@ static void goToPage(UiPage page) {
             // WO10 Step 2: real capture page now (drawCapturePage(),
             // not the generic placeholder). Prompt state is reset on
             // every entry - it's this page's own sub-state, never
-            // meaningful to carry across a navigation.
+            // meaningful to carry across a navigation. WO13: same for
+            // the REPLACE/ADD prompt.
             capturePromptActive = false;
+            captureReplaceAddPromptActive = false;
             drawCapturePage(title);
             break;
         }
         case PAGE_EDIT_SETTINGS: {
-            // WO11 Task 1 fix (was: WO10-FINAL unconditionally set
-            // pendingEdits[dev][port].dirty = true right here, on every
-            // entry - so merely walking capture -> settings -> Back
-            // dirtied the whole session and could trip the exit-editor
-            // prompt with nothing actually changed). Root cause: entry
-            // wrote through the SAME path a real edit does, with no
-            // comparison against what's already true for this port.
+            // WO11 Task 1 fix, generalized per-binding by WO13 (was:
+            // WO10-FINAL unconditionally set pendingEdits[dev][port].
+            // dirty = true right here, on every entry - so merely
+            // walking capture -> settings -> Back dirtied the whole
+            // session and could trip the exit-editor prompt with
+            // nothing actually changed). Root cause: entry wrote
+            // through the SAME path a real edit does, with no
+            // comparison against what's already true for this binding.
             //
-            // Fix: compute the TRUE current baseline for this port
-            // (existing pending edit if one exists, else the resolved
-            // live config - including its INPUT, not just invert/max/
-            // mode) and only commit into the pending session if the
-            // freshly-captured input actually differs from that
-            // baseline. A same-input revisit (or a first visit that
-            // just confirms what's already configured) no longer
-            // dirties anything by itself; invert/max/mode edits still
-            // commit via their own KEEP/SAVE paths below, which now
-            // also set dirty+input explicitly rather than relying on
-            // this entry-time write.
+            // Fix: compute the TRUE current baseline for the binding at
+            // editCtx.editing_binding_index (existing pending binding if
+            // one exists, else the resolved live binding, else - for a
+            // brand new slot one past the end - the compiled-in blank
+            // default) and only commit into the pending session if the
+            // currently-shown input actually differs from that
+            // baseline. A same-input revisit (port-select's direct entry
+            // to view an existing, unchanged binding) no longer dirties
+            // anything by itself; invert/max/mode edits still commit via
+            // their own KEEP/SAVE paths below.
             int dev = editCtx.selected_device;
             int port = editCtx.selected_port;
-            bool hadPending = pendingEdits[dev][port].dirty;
-            mkh_input_source_t baselineInput;
-            if (hadPending) {
-                baselineInput = pendingEdits[dev][port].input;
-                settingsWorkingInvert = pendingEdits[dev][port].invert;
-                settingsWorkingMax = pendingEdits[dev][port].max_percent;
-                settingsWorkingMode = pendingEdits[dev][port].mode;
-            } else {
+            int idx = editCtx.editing_binding_index;
+
+            // Seed the pending working copy from the live table on the
+            // FIRST touch this session (not yet dirty) - the whole
+            // binding list, so later edits/add/remove have a mutable
+            // in-memory copy distinct from the live table to work from.
+            if (!pendingEdits[dev][port].dirty) {
                 const mkh_port_config_t* cfg = mkh_config_get(dev, port);
-                baselineInput = cfg ? cfg->input : MKH_INPUT_NONE;
-                settingsWorkingInvert = cfg ? cfg->invert : false;
-                settingsWorkingMax = cfg ? cfg->max_percent : 100;
-                settingsWorkingMode = cfg ? cfg->mode : MKH_MODE_PROPORTIONAL;
+                pendingEdits[dev][port].binding_count = cfg ? cfg->binding_count : 0;
+                for (int i = 0; i < pendingEdits[dev][port].binding_count; i++) {
+                    pendingEdits[dev][port].bindings[i] = cfg->bindings[i];
+                }
             }
-            if (editCtx.captured_input != baselineInput) {
+
+            bool idxIsNewSlot = (idx >= pendingEdits[dev][port].binding_count);
+            mkh_binding_t baseline = idxIsNewSlot ? mkh_binding_t{MKH_INPUT_NONE, false, 100, MKH_MODE_PROPORTIONAL}
+                                                   : pendingEdits[dev][port].bindings[idx];
+
+            if (editCtx.capture_valid && editCtx.captured_input != baseline.input) {
+                baseline.input = editCtx.captured_input;
+                if (idxIsNewSlot) {
+                    pendingEdits[dev][port].bindings[pendingEdits[dev][port].binding_count++] = baseline;
+                } else {
+                    pendingEdits[dev][port].bindings[idx] = baseline;
+                }
                 pendingEdits[dev][port].dirty = true;
-                pendingEdits[dev][port].input = editCtx.captured_input;
-                pendingEdits[dev][port].invert = settingsWorkingInvert;
-                pendingEdits[dev][port].max_percent = settingsWorkingMax;
-                pendingEdits[dev][port].mode = settingsWorkingMode;
             }
+
+            settingsWorkingInvert = baseline.invert;
+            settingsWorkingMax = baseline.max_percent;
+            settingsWorkingMode = baseline.mode;
             settingsBaselineInvert = settingsWorkingInvert;
             settingsBaselineMax = settingsWorkingMax;
             settingsBaselineMode = settingsWorkingMode;
+            // Keep the displayed token in sync with whichever binding is
+            // now actually showing (matters when idxIsNewSlot was true
+            // but capture_valid was somehow false - defensive, shouldn't
+            // happen via the normal capture/port-select entry paths).
+            editCtx.captured_input = baseline.input;
+            editCtx.capture_valid = (baseline.input != MKH_INPUT_NONE);
             drawSettingsPage();
             break;
         }
@@ -1814,9 +2449,13 @@ static uint8_t mkStickYToChannelByte(int32_t axisY) {
     return (uint8_t)value;
 }
 
-// Applies a config port's invert/max attributes to a raw MK6 channel
-// byte (0x00..0xFF, 0x80=neutral). curve is always linear in v1 (see
-// mkh_config.h), so there's no curve step here.
+// Applies ONE binding's invert/max attributes to a raw MK6 channel byte
+// (0x00..0xFF, 0x80=neutral). curve is always linear in v1 (see
+// mkh_config.h), so there's no curve step here. WO13: was "a config
+// port's" - now a single binding's, since a port can carry several; the
+// function itself is unchanged, only its parameter type (mkh_port_
+// config_t -> mkh_binding_t), since invert/max/mode live on the binding
+// now, not the port.
 //
 // invert mirrors the byte around neutral (0x80). The protocol's byte
 // encoding has an inherent 127-wide forward span (0x80..0xFF) vs
@@ -1824,9 +2463,9 @@ static uint8_t mkStickYToChannelByte(int32_t axisY) {
 // so a byte-perfect mirror is impossible at the single extreme value
 // 0xFF (mirrors to 0x01, not 0x00); the clamp below is that one-unit
 // edge case, not a bug.
-static uint8_t mkApplyPortConfig(uint8_t rawByte, const mkh_port_config_t* cfg) {
+static uint8_t mkApplyBindingConfig(uint8_t rawByte, const mkh_binding_t* b) {
     int value = rawByte;
-    if (cfg->invert) {
+    if (b->invert) {
         value = 0x100 - value;
         if (value > 0xFF)
             value = 0xFF;
@@ -1835,7 +2474,7 @@ static uint8_t mkApplyPortConfig(uint8_t rawByte, const mkh_port_config_t* cfg) 
     }
 
     int delta = value - 0x80;
-    delta = (delta * (int)cfg->max_percent) / 100;
+    delta = (delta * (int)b->max_percent) / 100;
     value = 0x80 + delta;
     if (value > 0xFF)
         value = 0xFF;
@@ -1876,19 +2515,29 @@ static uint8_t mkTriggerToChannelByte(int32_t triggerValue) {
 // latchPrevPressed[] is the edge detector: a latch toggles on the
 // press EDGE, not the level, so holding the button doesn't rapidly
 // re-toggle every ~150ms loop tick.
-static bool latchState[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS];
-static bool latchPrevPressed[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS];
+//
+// WO13: now per-BINDING (a third array dimension) - a port can carry
+// several bindings, each independently in momentary/latched/proportional
+// mode, so each needs its own latch/edge state. Sized to
+// MKH_MAX_BINDINGS_PER_PORT regardless of how many bindings a port
+// actually has right now, same "leave room" pattern as the rest of the
+// per-device/per-channel arrays.
+static bool latchState[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDINGS_PER_PORT];
+static bool latchPrevPressed[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDINGS_PER_PORT];
 
-// WO11 Task 4 (hardening): reassigning a port away from latched mode and
-// back again via the editor could otherwise resurface a stale latchState
-// value from before the reassignment - a port pushed through
-// pushPendingSessionToLiveTable() (Test-ON/Save) always gets a fresh,
-// unlatched start, same "boots off" guarantee the order gives config
-// itself. Forward-declared above (near clearEditorSession()) so
-// pushPendingSessionToLiveTable(), defined earlier in the file, can call it.
+// WO11 Task 4 (hardening), extended WO13: reassigning a port away from
+// latched mode and back again via the editor could otherwise resurface a
+// stale latchState value from before the reassignment - a port pushed
+// through pushPendingSessionToLiveTable() (Test-ON/Save) always gets a
+// fresh, unlatched start for EVERY binding slot, same "boots off"
+// guarantee the order gives config itself. Forward-declared above (near
+// clearEditorSession()) so pushPendingSessionToLiveTable(), defined
+// earlier in the file, can call it.
 static void clearLatchStateForPort(int dev, int port) {
-    latchState[dev][port] = false;
-    latchPrevPressed[dev][port] = false;
+    for (int b = 0; b < MKH_MAX_BINDINGS_PER_PORT; b++) {
+        latchState[dev][port][b] = false;
+        latchPrevPressed[dev][port][b] = false;
+    }
 }
 
 static void clearLatchStateForDevice(int dev) {
@@ -1952,53 +2601,85 @@ static int32_t readTokenRaw(ControllerPtr ctl, mkh_input_source_t token) {
 }
 
 // WO10-FINAL rev B: the full-universe drive sweep, replacing v0.8.0
-// Step 2's stick-only version. Every assigned port is driven every
+// Step 2's stick-only version. Every assigned binding is driven every
 // call regardless of mode - proportional inputs scale continuously,
 // momentary is a simple pressed/released level, latched toggles on a
 // press edge and otherwise holds (see latchState[]/latchPrevPressed[]
-// above). All three funnel through the SAME mkApplyPortConfig()
-// invert/max pipeline (order: "all through the existing invert/max
+// above). All three funnel through the SAME mkApplyBindingConfig()
+// invert/max pipeline (order: "evaluate each through its own invert/max
 // pipeline") - only the pre-pipeline raw byte differs by class/mode.
+//
+// WO13: a port can now carry several bindings ("alternatives... used one
+// at a time" per the order's intent line, not a mixer). Arbitration is
+// exactly the order's spec - each binding's contribution is computed
+// independently through its own pipeline above, the contributions SUM,
+// and the sum clamps to +/-100% before one final value reaches
+// mkh_set_channel(). No "is this binding active" branching is needed to
+// get "used one at a time" in the common case: an idle/unpressed binding
+// already resolves to neutral (0x80, i.e. zero contribution) by
+// construction - proportional axes read 0 within the deadzone,
+// unpressed digitals/triggers read 0x80 - so summing every binding's
+// contribution unconditionally naturally reduces to "whichever one is
+// actually being touched" when only one is, and correctly adds when more
+// than one is touched at once, exactly as ordered.
 static void processMappedInputs(ControllerPtr ctl) {
     for (int dev = 0; dev < MKH_MK6_NUM_DEVICES; dev++) {
         for (int port = 0; port < MKH_MK6_NUM_CHANNELS; port++) {
             const mkh_port_config_t* cfg = mkh_config_get(dev, port);
-            if (!cfg || cfg->input == MKH_INPUT_NONE)
+            if (!cfg || cfg->binding_count == 0)
                 continue;
 
-            mkh_input_class_t cls = mkh_config_input_class(cfg->input);
-            uint8_t rawByte;
+            // Signed delta-from-neutral domain (0x80=neutral=0) for
+            // summing - the byte encoding's own asymmetric span
+            // (0x80..0xFF is 127-wide, 0x80..0x00 is 128-wide, see
+            // mkStickYToChannelByte()'s doc comment) is exactly the
+            // +127/-128 clamp band used below, so "clamp to +/-100%"
+            // needs no separate percent conversion.
+            int sumDelta = 0;
+            for (int bIdx = 0; bIdx < cfg->binding_count; bIdx++) {
+                const mkh_binding_t* binding = &cfg->bindings[bIdx];
+                mkh_input_class_t cls = mkh_config_input_class(binding->input);
+                uint8_t rawByte;
 
-            if (cls == MKH_INPUT_CLASS_AXIS) {
-                // Stick axes: no mode, always proportional (order) -
-                // cfg->mode is never consulted here, regardless of what
-                // it happens to hold.
-                rawByte = mkStickYToChannelByte(readTokenRaw(ctl, cfg->input));
-            } else if (cls == MKH_INPUT_CLASS_TRIGGER && cfg->mode == MKH_MODE_PROPORTIONAL) {
-                rawByte = mkTriggerToChannelByte(readTokenRaw(ctl, cfg->input));
-            } else {
-                // DIGITAL, or a TRIGGER explicitly set to momentary/
-                // latched - both resolve to a simple pressed/not level.
-                // Triggers use half-travel (511 of 1023) as the
-                // pressed/not-pressed split point for momentary/latched
-                // mode - CC's judgment, not specified by the order.
-                bool pressed = (cls == MKH_INPUT_CLASS_TRIGGER) ? (readTokenRaw(ctl, cfg->input) > (1023 / 2))
-                                                                 : (readTokenRaw(ctl, cfg->input) != 0);
-
-                if (cfg->mode == MKH_MODE_LATCHED) {
-                    if (pressed && !latchPrevPressed[dev][port]) {
-                        latchState[dev][port] = !latchState[dev][port];
-                    }
-                    latchPrevPressed[dev][port] = pressed;
-                    rawByte = latchState[dev][port] ? 0xFF : 0x80;
+                if (cls == MKH_INPUT_CLASS_AXIS) {
+                    // Stick axes: no mode, always proportional (order) -
+                    // binding->mode is never consulted here, regardless
+                    // of what it happens to hold.
+                    rawByte = mkStickYToChannelByte(readTokenRaw(ctl, binding->input));
+                } else if (cls == MKH_INPUT_CLASS_TRIGGER && binding->mode == MKH_MODE_PROPORTIONAL) {
+                    rawByte = mkTriggerToChannelByte(readTokenRaw(ctl, binding->input));
                 } else {
-                    // MOMENTARY - the only other legal mode for a
-                    // digital; for a trigger, the explicit momentary case.
-                    rawByte = pressed ? 0xFF : 0x80;
+                    // DIGITAL, or a TRIGGER explicitly set to momentary/
+                    // latched - both resolve to a simple pressed/not
+                    // level. Triggers use half-travel (511 of 1023) as
+                    // the pressed/not-pressed split point for momentary/
+                    // latched mode - CC's judgment, not specified by the
+                    // order.
+                    bool pressed = (cls == MKH_INPUT_CLASS_TRIGGER) ? (readTokenRaw(ctl, binding->input) > (1023 / 2))
+                                                                     : (readTokenRaw(ctl, binding->input) != 0);
+
+                    if (binding->mode == MKH_MODE_LATCHED) {
+                        if (pressed && !latchPrevPressed[dev][port][bIdx]) {
+                            latchState[dev][port][bIdx] = !latchState[dev][port][bIdx];
+                        }
+                        latchPrevPressed[dev][port][bIdx] = pressed;
+                        rawByte = latchState[dev][port][bIdx] ? 0xFF : 0x80;
+                    } else {
+                        // MOMENTARY - the only other legal mode for a
+                        // digital; for a trigger, the explicit momentary case.
+                        rawByte = pressed ? 0xFF : 0x80;
+                    }
                 }
+
+                uint8_t finalByte = mkApplyBindingConfig(rawByte, binding);
+                sumDelta += (int)finalByte - 0x80;
             }
 
-            mkh_set_channel(dev, port, mkApplyPortConfig(rawByte, cfg));
+            if (sumDelta > 127)
+                sumDelta = 127;
+            if (sumDelta < -128)
+                sumDelta = -128;
+            mkh_set_channel(dev, port, (uint8_t)(0x80 + sumDelta));
         }
     }
 }
@@ -2072,7 +2753,7 @@ void onDisconnectedController(ControllerPtr ctl) {
                 for (int dev = 0; dev < MKH_MK6_NUM_DEVICES; dev++) {
                     for (int port = 0; port < MKH_MK6_NUM_CHANNELS; port++) {
                         const mkh_port_config_t* cfg = mkh_config_get(dev, port);
-                        if (cfg && cfg->input != MKH_INPUT_NONE) {
+                        if (cfg && cfg->binding_count > 0) {
                             mkh_set_channel(dev, port, 0x80);
                         }
                     }
@@ -2552,6 +3233,13 @@ void loop() {
     bool dataUpdated = BP32.update();
     if (dataUpdated)
         processControllers();
+
+    // WO13 Task 3: battery ADC read - runs every tick regardless of
+    // page, gated internally to its own ~1s interval (see
+    // updateBatteryReading()'s doc comment). Display-layer + one ADC
+    // read only; drawing (dashboard-only) happens separately via
+    // initDashboard()/updateDashboard().
+    updateBatteryReading();
 
     // WO10 Step 0: touch dispatch is now page-aware. The dashboard's hit
     // zones (settings button + MKH rows, debounce, transition lockout)

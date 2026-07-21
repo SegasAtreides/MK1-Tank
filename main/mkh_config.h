@@ -89,13 +89,40 @@ typedef enum {
     MKH_MODE_LATCHED,
 } mkh_input_mode_t;
 
+// WO13: a port carries up to this many bindings. Soft cap - trivially
+// raisable, sized generously above any real use (18 input tokens exist
+// total, so 8 alternative ways to reach one port already covers nearly
+// half the universe). Reported verbatim in the completion report.
+#define MKH_MAX_BINDINGS_PER_PORT 8
+
+// WO13: one binding = one input token with its own invert/max/mode.
+// Bindings on the same port are ALTERNATIVES ("bound several controls to
+// reach it different ways, used one at a time"), not a mixer - see
+// mkh_port_config_t's doc comment and processMappedInputs() (sketch.cpp)
+// for the sum-and-clamp arbitration that falls out naturally when an
+// idle/unpressed binding already contributes zero.
 typedef struct {
     mkh_input_source_t input;
     bool invert;
     uint8_t max_percent;  // 0..100
     mkh_input_mode_t mode;
-    bool from_file;  // true if this port's value came from the config
-                      // file; false if it's still the compiled-in default
+} mkh_binding_t;
+
+// WO13: a port now holds an ordered list of bindings instead of a single
+// one. binding_count == 0 means "unassigned" (replaces the old input ==
+// MKH_INPUT_NONE check throughout sketch.cpp/mkh_config.c). Arbitration
+// across bindings on the same port (when more than one is simultaneously
+// active) is entirely a drive-time concern - see processMappedInputs()
+// (sketch.cpp): each binding runs through its own invert/max pipeline to
+// a signed contribution, contributions sum, the sum clamps to +/-100%,
+// and exactly one resulting byte reaches mkh_set_channel() as before.
+// Nothing here (or in mkh_broadcast.c) needs to know a port can have more
+// than one binding.
+typedef struct {
+    mkh_binding_t bindings[MKH_MAX_BINDINGS_PER_PORT];
+    int binding_count;
+    bool from_file;  // true if this port's bindings came from the config
+                      // file; false if still the compiled-in default
 } mkh_port_config_t;
 
 // Resets the whole table to compiled-in defaults, reproducing v0.7.0
@@ -110,12 +137,21 @@ void mkh_config_set_defaults(void);
 // Blank lines and lines starting with '#' are silently ignored. Any
 // parse problem (unrecognized key, out-of-range hub/port, invalid
 // invert/max/mode value, unknown attribute) logs a warning and skips
-// the WHOLE line - the affected port simply keeps its current (default)
-// value. curve is the one exception: an unsupported curve value logs a
-// warning but the rest of the line still applies (curve is always
-// treated as linear). mode= is optional - absent resolves to the
+// the WHOLE line - the affected port simply keeps whatever bindings it
+// already had. curve is the one exception: an unsupported curve value
+// logs a warning but the rest of the line still applies (curve is
+// always treated as linear). mode= is optional - absent resolves to the
 // type-appropriate default (see default_mode_for_input() in
 // mkh_config.c) so pre-rev-B files stay valid unchanged.
+//
+// WO13: a valid line APPENDS a new binding to its port rather than
+// replacing it - repeated "HUB<n>_PORT_<letter> = ..." lines for the
+// same port accumulate, up to MKH_MAX_BINDINGS_PER_PORT (a line past
+// the cap logs a warning and is skipped, same failure posture as any
+// other rejected line). This is why a pre-WO13 file with exactly one
+// line per port still parses to exactly one binding per port,
+// unchanged - the accumulation rule is a strict superset of the old
+// "last line wins" single-binding behavior when there's only one line.
 void mkh_config_parse_line(const char* raw_line);
 
 // Records whether the config file was successfully opened at all (drives
@@ -141,13 +177,16 @@ void mkh_config_log_table(void);
 // device_id/port. Not consumed by input handling until Step 2.
 const mkh_port_config_t* mkh_config_get(int device_id, int port);
 
-// WO10-FINAL: directly writes one port's resolved config into the live
-// table - used by the mapping editor's Test-push and Save-apply paths.
-// Bypasses parsing entirely (this is already-validated in-memory data,
-// not raw file text); out-of-range device_id/port is a silent no-op,
-// matching mkh_config_get()'s NULL-on-invalid-range convention.
-void mkh_config_set_port(int device_id, int port, mkh_input_source_t input, bool invert, uint8_t max_percent,
-                          mkh_input_mode_t mode);
+// WO13 (was mkh_config_set_port(), single-binding): directly writes one
+// port's WHOLE binding list into the live table - used by the mapping
+// editor's Test-push and Save-apply paths. Replaces whatever bindings
+// the port previously had (the editor's pending-edit state is always
+// the full, authoritative list for a port it touched, same pattern as
+// the pre-WO13 single-binding setter). Bypasses parsing entirely
+// (already-validated in-memory data, not raw file text); out-of-range
+// device_id/port or count is a silent no-op. count == 0 is valid and
+// means "unassign this port" (bindings may be NULL in that case).
+void mkh_config_set_port_bindings(int device_id, int port, const mkh_binding_t* bindings, int count);
 
 // WO10-FINAL: public token-name lookup (thin wrapper over the private
 // table mkh_config.c already keeps for parsing/logging) - lets
@@ -155,20 +194,22 @@ void mkh_config_set_port(int device_id, int port, mkh_input_source_t input, bool
 // keeping a second copy of the name table in sync by hand.
 const char* mkh_config_input_token_name(mkh_input_source_t input);
 
-// WO10-FINAL: serializes the resolved table into buf, one
+// WO10-FINAL, extended WO13: serializes the resolved table into buf, one
 // "HUB<n>_PORT_<letter> = <input> invert=<yes|no> max=<0-100>
-// curve=linear [mode=<proportional|momentary|latched>]" line per
-// assigned port (input != MKH_INPUT_NONE) - exactly the format
-// mkh_config_parse_line() reads, so editor-written files round-trip
-// through the existing parser unchanged. mode= is omitted for
-// MKH_INPUT_CLASS_AXIS ports (meaningless there - see mkh_input_mode_t)
-// and written explicitly otherwise, even when it equals the default,
-// so a saved file never depends on a future default changing out from
-// under it. Unassigned ports are omitted entirely (the parser already
-// defaults those to NONE). Returns the number of bytes written
-// (excluding the null terminator), or -1 if buf_size is too small to
-// hold the whole table (buf's content is unspecified in that case - the
-// caller should not use it).
+// curve=linear [mode=<proportional|momentary|latched>]" line per BINDING
+// (not per port - a port with N bindings writes N lines, in binding
+// order) - exactly the additive format mkh_config_parse_line() reads
+// (repeated "=" lines for the same port accumulate), so editor-written
+// files round-trip through the existing parser unchanged, and a
+// pre-WO13 single-binding file is just the N==1 case. mode= is omitted
+// for MKH_INPUT_CLASS_AXIS bindings (meaningless there - see
+// mkh_input_mode_t) and written explicitly otherwise, even when it
+// equals the default, so a saved file never depends on a future default
+// changing out from under it. Ports with zero bindings are omitted
+// entirely. Returns the number of bytes written (excluding the null
+// terminator), or -1 if buf_size is too small to hold the whole table
+// (buf's content is unspecified in that case - the caller should not
+// use it).
 int mkh_config_serialize(char* buf, size_t buf_size);
 
 #ifdef __cplusplus
