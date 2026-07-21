@@ -11,6 +11,17 @@ on-device input-mapping editor - no companion app, no PC required.
 
 MK1-Tank stands on the work of others, gratefully acknowledged:
 
+- **The Mould King protocol reverse-engineering lineage** — this firmware's hub protocol
+  (`mkh_protocol`) was ported from and cross-checked byte-for-byte against three
+  independent references, all of which agree on the telegram format:
+  - **[J0EK3R](https://github.com/J0EK3R)**'s
+    [mkconnect-python](https://github.com/J0EK3R/mkconnect-python)
+  - **[vicocz](https://github.com/vicocz)**'s Mould King implementation for
+    [BrickController2](https://github.com/imurvai/brickcontroller2)
+    (original app by **[imurvai](https://github.com/imurvai)**)
+  - **[Espruino](https://github.com/espruino)**'s
+    [mouldking.js](https://github.com/espruino/EspruinoDocs/blob/master/devices/mouldking.js)
+    module
 - **[Bluepad32](https://github.com/ricardoquesada/bluepad32)** by Ricardo Quesada — the
   Bluetooth gamepad library that makes the Xbox Wireless Controller link possible, and the
   [project template](https://github.com/ricardoquesada/esp-idf-arduino-bluepad32-template)
@@ -19,8 +30,6 @@ MK1-Tank stands on the work of others, gratefully acknowledged:
   Bluetooth stack.
 - **Waveshare** — for the [ESP32-S3-Touch-LCD-2](https://www.waveshare.com/wiki/ESP32-S3-Touch-LCD-2)
   board and its documentation, schematics, and demo code.
-- The **Mould King BLE protocol** reverse-engineering work shared by the LEGO/MK hobbyist
-  community, without which no third-party controller could talk to these hubs.
 
 Full license details for third-party components are in [NOTICE](NOTICE) and [LICENSE](LICENSE).
 
