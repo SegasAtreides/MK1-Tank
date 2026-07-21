@@ -1661,17 +1661,24 @@ static bool settingsPromptActive = false;
 // page (CC's judgment, reported) - the standalone "CURVE: LINEAR" line
 // is dropped (folded into the MAX row's own label instead; curve was
 // already fixed/non-selectable in v1, purely decorative) to free a full
-// 40px row, and binding Prev/Next navigation is folded into the title
-// row's own corners (arrow hit-zones extending the full 0-40px band,
-// same "hit zone may exceed the visual" precedent as the dashboard's
-// settings button) rather than claiming a row of its own. Five 40px
-// rows total, each with >=20px screen-edge margins: title/nav (0-40),
-// invert/mode (44-84), max/slider+nudge (88-128), add/remove binding
-// (132-172), back/reset/save (180-220, UNCHANGED from WO11 - still
-// 20px to the 240px bottom edge).
+// 40px row. Five 40px rows total, each with >=20px screen-edge margins:
+// title (0-40, informational text only - see below), invert/mode
+// (44-84), max/slider+nudge (88-128), binding actions (132-172),
+// back/reset/save (180-220, UNCHANGED from WO11 - still 20px to the
+// 240px bottom edge).
+//
+// PM bench feedback: Prev/Next was originally corner arrows on the title
+// row (hit-zone-exceeds-visual, same precedent as the dashboard's
+// settings button) - the RIGHT corner turned out to collide with
+// TEST_TOGGLE, which sits in that exact corner on every editor page
+// (drawTestToggle() is called on capture/settings/hub/port select
+// alike, unlike SET which is dashboard-only). Fixed by moving Prev/Next
+// off the corners entirely, into the binding-actions row alongside
+// Add/Remove (4 buttons, none within 60px of TEST_TOGGLE's y=2-26
+// footprint) - the title row is now purely informational text, no
+// touch zones of its own.
 static const int16_t SPAGE_NAV_Y = 0;
 static const int16_t SPAGE_NAV_H = 40;
-static const int16_t SPAGE_NAV_ARROW_W = 44;  // >= 40px minimum, flush to each screen edge
 static const int16_t SPAGE_TOGGLE_ROW_Y = 44;
 static const int16_t SPAGE_TOGGLE_ROW_H = 40;  // meets the 40px minimum
 static const int16_t SPAGE_TOGGLE_MID_X = 160;  // left = invert, right = mode
@@ -1689,6 +1696,18 @@ static const int16_t SPAGE_SLIDER_W = SPAGE_NUDGE_PLUS_X - 8 - SPAGE_SLIDER_X;  
 static const int16_t SPAGE_SLIDER_TRACK_H = 12;
 static const int16_t SPAGE_BINDING_ACTIONS_Y = 132;
 static const int16_t SPAGE_BINDING_ACTIONS_H = 40;
+// PREV | ADD | REMOVE | NEXT, left to right - all >=40px tall (this
+// row's own height), PREV/NEXT narrower since they're single-glyph.
+// 20 + 50 + 10 + 70 + 10 + 70 + 10 + 60 = 300, right edge at 300, 20px
+// margin to the 320px screen edge - matches every other row's margin.
+static const int16_t SPAGE_PREV_X = 20;
+static const int16_t SPAGE_PREV_W = 50;
+static const int16_t SPAGE_ADD_X = 80;
+static const int16_t SPAGE_ADD_W = 70;
+static const int16_t SPAGE_REMOVE_X = 160;
+static const int16_t SPAGE_REMOVE_W = 70;
+static const int16_t SPAGE_NEXT_X = 240;
+static const int16_t SPAGE_NEXT_W = 60;
 
 static const int16_t SPAGE_BACK_X = 20;
 static const int16_t SPAGE_RESET_X = 120;
@@ -1824,17 +1843,29 @@ static void drawSettingsMaxRow() {
 // raisable but still enforced here, not just in the parser. Remove
 // binding has no floor - removing the last binding leaves the port
 // unassigned, same "no exclusivity rules" simplicity as the rest of
-// Task 1.
+// Task 1. PREV/NEXT live here too (see SPAGE_NAV_Y's doc comment for
+// why they moved off the title row's corners) - greyed out (drawn, but
+// a no-op tap) at whichever end of the binding list is already showing,
+// and entirely absent when the port has only one binding (nothing to
+// page between).
 static void drawSettingsBindingActionsRow() {
     display->fillRect(0, SPAGE_BINDING_ACTIONS_Y, SCR_W, SPAGE_BINDING_ACTIONS_H, COLOR_BG);
     int dev = editCtx.selected_device;
     int port = editCtx.selected_port;
+    int idx = editCtx.editing_binding_index;
     int count = pendingEdits[dev][port].dirty ? pendingEdits[dev][port].binding_count
                                                : effectiveBindingCount(dev, port);
     bool canAdd = count < MKH_MAX_BINDINGS_PER_PORT;
-    drawButtonAt(SPAGE_BACK_X, SPAGE_BINDING_ACTIONS_Y, SPAGE_BTN_W, SPAGE_BINDING_ACTIONS_H,
+
+    if (count > 1) {
+        drawButtonAt(SPAGE_PREV_X, SPAGE_BINDING_ACTIONS_Y, SPAGE_PREV_W, SPAGE_BINDING_ACTIONS_H,
+                     idx > 0 ? "<" : "-");
+        drawButtonAt(SPAGE_NEXT_X, SPAGE_BINDING_ACTIONS_Y, SPAGE_NEXT_W, SPAGE_BINDING_ACTIONS_H,
+                     idx < count - 1 ? ">" : "-");
+    }
+    drawButtonAt(SPAGE_ADD_X, SPAGE_BINDING_ACTIONS_Y, SPAGE_ADD_W, SPAGE_BINDING_ACTIONS_H,
                  canAdd ? "ADD" : "ADD (MAX)");
-    drawButtonAt(SPAGE_SAVE_X, SPAGE_BINDING_ACTIONS_Y, SPAGE_BTN_W, SPAGE_BINDING_ACTIONS_H, "REMOVE");
+    drawButtonAt(SPAGE_REMOVE_X, SPAGE_BINDING_ACTIONS_Y, SPAGE_REMOVE_W, SPAGE_BINDING_ACTIONS_H, "REMOVE");
 }
 
 static void drawSettingsButtons() {
@@ -1881,19 +1912,11 @@ static void drawSettingsNavRow() {
         display->setTextSize(1);
         display->setCursor((SCR_W - textWidth(inputLine, 1)) / 2, 28);
         display->print(inputLine);
-        return;
     }
-
-    display->setTextSize(2);
-    if (editCtx.editing_binding_index > 0) {
-        display->setCursor((SPAGE_NAV_ARROW_W - textWidth("<", 2)) / 2, (SPAGE_NAV_H - 16) / 2);
-        display->print("<");
-    }
-    if (editCtx.editing_binding_index < count - 1) {
-        display->setCursor(SCR_W - SPAGE_NAV_ARROW_W + (SPAGE_NAV_ARROW_W - textWidth(">", 2)) / 2,
-                            (SPAGE_NAV_H - 16) / 2);
-        display->print(">");
-    }
+    // count > 1: the "(i/N)" already folded into the title above is
+    // enough context here - Prev/Next themselves are buttons on the
+    // binding-actions row (see drawSettingsBindingActionsRow()), not
+    // touch zones on this row.
 }
 
 static void drawSettingsPage() {
@@ -2024,27 +2047,6 @@ static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
         return;
     }
 
-    // WO13: Prev/Next binding navigation, corners of the nav row - only
-    // live when the port carries more than one binding right now.
-    bool inNavRow = touchY >= SPAGE_NAV_Y && touchY < SPAGE_NAV_Y + SPAGE_NAV_H;
-    if (inNavRow) {
-        int count = pendingEdits[dev][port].dirty ? pendingEdits[dev][port].binding_count
-                                                   : effectiveBindingCount(dev, port);
-        if (count > 1 && touchX < SPAGE_NAV_ARROW_W && idx > 0) {
-            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings PREV binding (%d -> %d)\n", touchX,
-                            touchY, idx, idx - 1);
-            settingsCommitWorkingIfDirty(dev, port, idx);
-            settingsLoadBindingAt(dev, port, idx - 1);
-            return;
-        }
-        if (count > 1 && touchX >= SCR_W - SPAGE_NAV_ARROW_W && idx < count - 1) {
-            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings NEXT binding (%d -> %d)\n", touchX,
-                            touchY, idx, idx + 1);
-            settingsCommitWorkingIfDirty(dev, port, idx);
-            settingsLoadBindingAt(dev, port, idx + 1);
-            return;
-        }
-    }
 
     // WO11 Task 2: INVERT (left half) and MODE (right half) now share
     // one 40px row, split at SPAGE_TOGGLE_MID_X.
@@ -2096,10 +2098,30 @@ static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
         return;
     }
 
-    // WO13 Task 1: Add binding / Remove binding row.
+    // WO13 Task 1: PREV / ADD / REMOVE / NEXT row (see SPAGE_NAV_Y's doc
+    // comment for why Prev/Next live here instead of the title row's
+    // corners).
     bool inBindingActionsRow = touchY >= SPAGE_BINDING_ACTIONS_Y && touchY < SPAGE_BINDING_ACTIONS_Y + SPAGE_BINDING_ACTIONS_H;
-    bool inAddBtn = inBindingActionsRow && touchX >= SPAGE_BACK_X && touchX < SPAGE_BACK_X + SPAGE_BTN_W;
-    bool inRemoveBtn = inBindingActionsRow && touchX >= SPAGE_SAVE_X && touchX < SPAGE_SAVE_X + SPAGE_BTN_W;
+    bool inPrevBtn = inBindingActionsRow && touchX >= SPAGE_PREV_X && touchX < SPAGE_PREV_X + SPAGE_PREV_W;
+    bool inAddBtn = inBindingActionsRow && touchX >= SPAGE_ADD_X && touchX < SPAGE_ADD_X + SPAGE_ADD_W;
+    bool inRemoveBtn = inBindingActionsRow && touchX >= SPAGE_REMOVE_X && touchX < SPAGE_REMOVE_X + SPAGE_REMOVE_W;
+    bool inNextBtn = inBindingActionsRow && touchX >= SPAGE_NEXT_X && touchX < SPAGE_NEXT_X + SPAGE_NEXT_W;
+    if (inPrevBtn || inNextBtn) {
+        int count = pendingEdits[dev][port].dirty ? pendingEdits[dev][port].binding_count
+                                                   : effectiveBindingCount(dev, port);
+        if (inPrevBtn && count > 1 && idx > 0) {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings PREV binding (%d -> %d)\n", touchX,
+                            touchY, idx, idx - 1);
+            settingsCommitWorkingIfDirty(dev, port, idx);
+            settingsLoadBindingAt(dev, port, idx - 1);
+        } else if (inNextBtn && count > 1 && idx < count - 1) {
+            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings NEXT binding (%d -> %d)\n", touchX,
+                            touchY, idx, idx + 1);
+            settingsCommitWorkingIfDirty(dev, port, idx);
+            settingsLoadBindingAt(dev, port, idx + 1);
+        }
+        return;
+    }
     if (inAddBtn) {
         int count = pendingEdits[dev][port].dirty ? pendingEdits[dev][port].binding_count
                                                    : effectiveBindingCount(dev, port);
