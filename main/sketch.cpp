@@ -11,7 +11,9 @@
 #include <Arduino_GFX_Library.h>
 
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "esp_sleep.h"
+#include "esp_system.h"
 
 #include "mkh_broadcast.h"
 #include "mkh_config.h"
@@ -3232,8 +3234,10 @@ void setup() {
     // return from deep sleep via the BOOT-key wake, per the order's own
     // wake self-test/acceptance criteria ("tap -> boots to dashboard").
     esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
-    Console.printf("MK1 Boot: wakeup cause=%d (%s)\n", (int)wakeCause,
-                    wakeCause == ESP_SLEEP_WAKEUP_EXT0 ? "EXT0 BOOT-key wake from deep sleep" : "power-on/other reset");
+    esp_reset_reason_t resetReason = esp_reset_reason();
+    Console.printf("MK1 Boot: wakeup cause=%d (%s), reset reason=%d\n", (int)wakeCause,
+                    wakeCause == ESP_SLEEP_WAKEUP_EXT0 ? "EXT0 BOOT-key wake from deep sleep" : "power-on/other reset",
+                    (int)resetReason);
 
     // v0.8.0 Step 0b: LittleFS storage foundation. Internal flash has no
     // shared-bus constraint with the display (unlike the retired SD
@@ -3396,6 +3400,19 @@ static void enterDeepSleep() {
     // ownership for ext0 wake - harmless, since the backlight is already
     // off by this point.
     pinMode(TFT_RST, INPUT);
+
+    // WO16 bench fix: the RTC pad's own pull configuration does NOT
+    // inherit whatever the digital-domain GPIO driver had set - without
+    // this, GPIO0 can float once the RTC controller takes over the pad,
+    // and a level-triggered ext0 wake (armed just below) on a floating
+    // pin can fire immediately/spuriously instead of waiting for an
+    // actual BOOT-key press (observed at the bench: screen goes dark,
+    // then reboots almost immediately rather than staying asleep).
+    // Explicitly enabling the RTC pad's own internal pull-up removes the
+    // dependency on the board's external pull-up being strong enough
+    // once GPIO0 leaves the digital domain.
+    rtc_gpio_pullup_en(MKH_WAKE_GPIO);
+    rtc_gpio_pulldown_dis(MKH_WAKE_GPIO);
 
     esp_sleep_enable_ext0_wakeup(MKH_WAKE_GPIO, 0);  // wake on LOW (BOOT key press)
     Console.printf("MK1 Sleep: display off, entering deep sleep now (wake source = BOOT key / GPIO0 LOW)\n");
