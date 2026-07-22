@@ -41,7 +41,20 @@ static Arduino_GFX* display = new Arduino_ST7789(displayBus, TFT_RST, 1, true, 2
 // boot splash and the stats page (per the order - the dashboard's own
 // DASH_TITLE below is a separate, pre-existing string, out of WO11's
 // scope to touch).
-#define MK1_FW_VERSION "v0.11.0"
+//
+// Bugfix (version-string audit): was a hand-maintained literal
+// ("v0.11.0", last bumped in WO11 and never updated across five
+// subsequent releases - the exact bench finding this fix addresses).
+// Now derived at build time from the actual git tag/commit via
+// extract_version.py (see platformio.ini's extra_scripts) - MK1_GIT_VERSION
+// is injected as a CPPDEFINE; the #ifndef fallback only matters if
+// someone builds without that script running (e.g. a raw `cmake`
+// invocation bypassing PlatformIO), so it's deliberately NOT a plausible-
+// looking version string - "unbuilt" can't be mistaken for a real release.
+#ifndef MK1_GIT_VERSION
+#define MK1_GIT_VERSION "unbuilt"
+#endif
+#define MK1_FW_VERSION MK1_GIT_VERSION
 
 // WO11: telegram service rate label for the stats page. Mirrors
 // mkh_broadcast.c's MKH_CONTROL_REPEAT_MS (100ms slice re-arm) and
