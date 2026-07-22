@@ -62,8 +62,23 @@
 #include "mkh_protocol.h"
 #include "uni_log.h"
 
-// 160 * 0.625ms = 100ms advertising interval.
-#define MKH_ADV_INTERVAL_UNITS 160
+// WO v1.4.0: reduced from 160 (100ms) to 40 units - 40 * 0.625ms = 25ms
+// advertising interval. Sanctioned amendment to the broadcast-timing
+// freeze, specifically to fix the PULSE misfire bug (see the WO's own
+// completion report): a PULSE binding's full-level payload is only
+// staged for its short, fixed duration (~100-165ms at the current
+// default), and the hardware radio's own independent retransmission
+// clock - this constant - was the sole determinant of how many actual
+// on-air chances a hub got to receive it before it reverted to neutral.
+// At the old 100ms interval, that was only 1-2 transmissions; at 25ms,
+// it's roughly 4x that within the same window. Verified within BTstack's
+// own documented valid range for this HCI parameter (components/btstack/
+// src/hci_cmd.c: hci_le_set_advertising_parameters, [0x0020,0x4000] =
+// [32,16384] units - 40 comfortably clears the 32-unit floor) before
+// this was chosen; no HCI/GAP error was observed after flashing (see
+// mkh_check_command_complete() below, unchanged, still watching for
+// exactly this).
+#define MKH_ADV_INTERVAL_UNITS 40
 // Non-connectable, non-scannable undirected advertising (BT Core spec
 // legacy advertising type enum, see components/btstack/src/hci.c around
 // the ADV_NONCONN_IND decode and hci_cmd.c's hci_le_set_advertising_parameters).
