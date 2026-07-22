@@ -84,16 +84,49 @@ void mkh_config_set_defaults(void) {
             s_table[d][p].from_file = false;
         }
     }
-    // Reproduces v0.7.0 exactly: left stick -> device 0 port A, right
-    // stick -> device 1 port A. WO13: each is now binding[0] of a
-    // 1-binding port rather than the port's only fields.
-    s_table[0][MKH_PORT_A].bindings[0] =
-        (mkh_binding_t){.input = MKH_INPUT_LSNS, .invert = false, .max_percent = 100, .mode = MKH_MODE_PROPORTIONAL};
-    s_table[0][MKH_PORT_A].binding_count = 1;
-    s_table[1][MKH_PORT_A].bindings[0] =
-        (mkh_binding_t){.input = MKH_INPUT_RSNS, .invert = false, .max_percent = 100, .mode = MKH_MODE_PROPORTIONAL};
-    s_table[1][MKH_PORT_A].binding_count = 1;
     s_skipped_lines = 0;
+    // BUGFIX #N: the compiled-in fallback bindings (device0/portA=LSNS,
+    // device1/portA=RSNS) used to be pre-seeded right here, before any
+    // file line is parsed. That was correct under the pre-WO13 parser's
+    // "last line wins" (REPLACE) semantics, but WO13 changed
+    // mkh_config_parse_line() to APPEND a binding to whatever a port
+    // already has - so a file line addressing either of these two ports
+    // (the common case: LSNS/RSNS on port A is the expected default
+    // mapping, so most files have it) got appended ON TOP of the
+    // pre-seeded compiled-in binding instead of replacing it, silently
+    // doubling that port's binding count on every boot. Root cause of
+    // the config-duplication bug (see BUGFIX #N completion report) -
+    // reproduced 100% deterministically on a blank chip with the stock,
+    // unmodified default file, zero editor interaction.
+    //
+    // Fix: the fallback now only applies AFTER parsing, and only to a
+    // port still at binding_count==0 at that point - see
+    // mkh_config_apply_compiled_in_fallbacks(), called from every
+    // "table resolution is final" point in mkh_storage.cpp. This
+    // function now does exactly what its name says - reset to a blank
+    // slate - nothing else.
+}
+
+// BUGFIX #N: applies the v0.7.0-compatible compiled-in fallback
+// (device0/portA=LSNS, device1/portA=RSNS) to those two ports, but ONLY
+// if a port is STILL unassigned (binding_count==0) - i.e. only if
+// nothing (no file, a file that doesn't mention that port, or a file-
+// open/mount failure) ever gave it a real binding. Must run AFTER
+// parsing/mount-resolution is complete, never before - see
+// mkh_config_set_defaults()'s doc comment for why "before" was the bug.
+// Idempotent and safe to call multiple times or on an already-populated
+// port (no-ops there, by the same binding_count==0 guard).
+void mkh_config_apply_compiled_in_fallbacks(void) {
+    if (s_table[0][MKH_PORT_A].binding_count == 0) {
+        s_table[0][MKH_PORT_A].bindings[0] =
+            (mkh_binding_t){.input = MKH_INPUT_LSNS, .invert = false, .max_percent = 100, .mode = MKH_MODE_PROPORTIONAL};
+        s_table[0][MKH_PORT_A].binding_count = 1;
+    }
+    if (s_table[1][MKH_PORT_A].binding_count == 0) {
+        s_table[1][MKH_PORT_A].bindings[0] =
+            (mkh_binding_t){.input = MKH_INPUT_RSNS, .invert = false, .max_percent = 100, .mode = MKH_MODE_PROPORTIONAL};
+        s_table[1][MKH_PORT_A].binding_count = 1;
+    }
 }
 
 int mkh_config_get_skipped_line_count(void) {

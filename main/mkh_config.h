@@ -125,13 +125,26 @@ typedef struct {
                       // file; false if still the compiled-in default
 } mkh_port_config_t;
 
-// Resets the whole table to compiled-in defaults, reproducing v0.7.0
-// behavior exactly: HUB1 (device 0) port A = LSNS, HUB2 (device 1) port
-// A = RSNS, every other port unassigned. Called once at the start of
-// mkh_storage_boot_read(), before any file access is attempted, so the
-// table is always in a known-safe state even if storage access never
-// succeeds.
+// Resets the whole table to a blank slate (every port unassigned,
+// binding_count=0). Called once at the start of mkh_storage_boot_read()
+// and mkh_storage_reload_config(), before any file access is attempted,
+// so the table is always in a known-safe state even if storage access
+// never succeeds.
+//
+// BUGFIX #N: no longer pre-seeds the compiled-in fallback bindings
+// (HUB1/A=LSNS, HUB2/A=RSNS) itself - see
+// mkh_config_apply_compiled_in_fallbacks() below for why, and for where
+// that now happens instead.
 void mkh_config_set_defaults(void);
+
+// BUGFIX #N: applies the v0.7.0-compatible compiled-in fallback (HUB1
+// port A = LSNS, HUB2 port A = RSNS) to those two specific ports, but
+// ONLY to a port still at binding_count==0 - i.e. only if nothing (file
+// absence, a file that doesn't mention that port, or a storage failure)
+// ever gave it a real binding. Call AFTER file parsing/mount-resolution
+// is complete, never before (see mkh_config_set_defaults()'s doc comment
+// for the bug this ordering fixes). Idempotent.
+void mkh_config_apply_compiled_in_fallbacks(void);
 
 // Parses one line of /mk1config.txt and updates the table in place.
 // Blank lines and lines starting with '#' are silently ignored. Any
