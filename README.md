@@ -6,8 +6,75 @@ up to three Mould King Bluetooth hubs over the Mould King 6.0 (MK6) RC
 protocol. The board's touchscreen doubles as a live dashboard and an
 on-device input-mapping editor - no companion app, no PC required.
 
-![MK1-Tank - front/side view](docs/images/tank-front.jpg)
-<!-- PM: replace with an actual photo before publishing -->
+
+## Acknowledgments
+
+MK1-Tank stands on the work of others, gratefully acknowledged:
+
+- **The Mould King protocol reverse-engineering lineage** — this firmware's hub protocol
+  (`mkh_protocol`) was ported from and cross-checked byte-for-byte against three
+  independent references, all of which agree on the telegram format:
+  - **[J0EK3R](https://github.com/J0EK3R)**'s
+    [mkconnect-python](https://github.com/J0EK3R/mkconnect-python)
+  - **[vicocz](https://github.com/vicocz)**'s Mould King implementation for
+    [BrickController2](https://github.com/imurvai/brickcontroller2)
+    (original app by **[imurvai](https://github.com/imurvai)**)
+  - **[Espruino](https://github.com/espruino)**'s
+    [mouldking.js](https://github.com/espruino/EspruinoDocs/blob/master/devices/mouldking.js)
+    module
+- **[Bluepad32](https://github.com/ricardoquesada/bluepad32)** by Ricardo Quesada — the
+  Bluetooth gamepad library that makes the Xbox Wireless Controller link possible, and the
+  [project template](https://github.com/ricardoquesada/esp-idf-arduino-bluepad32-template)
+  this firmware was built from.
+- **[BTstack](https://github.com/bluekitchen/btstack)** by BlueKitchen — the underlying
+  Bluetooth stack.
+- **Waveshare** — for the [ESP32-S3-Touch-LCD-2](https://www.waveshare.com/wiki/ESP32-S3-Touch-LCD-2)
+  board and its documentation, schematics, and demo code.
+
+Full license details for third-party components are in [NOTICE](NOTICE) and [LICENSE](LICENSE).
+
+## Why this project exists
+
+I built MK1-Tank because phone-based control of Mould King 6.0 hubs has practical
+limits — not because the apps are bad, but because they run on phones.
+
+BrickController2 did the pioneering work and proved these hubs can be driven from a
+gamepad via BLE advertising telegrams. But a phone app has to live with the phone's
+rules:
+
+- **The screen must stay on.** The hubs need a continuous telegram stream. When the
+  screen turns off or the app goes to the background, the OS can throttle or suspend
+  Bluetooth broadcasting and the model stops mid-run.
+- **Portability.** In the field you're managing a gamepad plus a phone that has to
+  stay awake, unlocked, and in range. One more battery, one more screen.
+
+MK1-Tank removes the phone. A dedicated ESP32-S3 board with its own touchscreen
+pairs directly with an Xbox Wireless Controller and broadcasts the hub telegrams
+itself. Configuration happens on the touchscreen: no phone, no PC, no cables.
+
+### Design philosophy
+
+I'm a former Program Implementation Manager at Amazon, and this build follows the
+Invent and Simplify principle: don't work around a limitation, remove the component
+that causes it.
+
+- **Remove the phone** and the screen-off problem doesn't need solving.
+- **Right-size the power:** a larger LiPo for the motor hubs, a small dedicated cell
+  for the ESP32. Each system has its own energy budget.
+- **Buy headroom, not features:** the board's QMI8658 IMU (accelerometer + gyroscope)
+  is unused for now. It's there for future turret stabilization and motion-aware
+  upgrades.
+
+Every release was specified, bench-tested, and accepted on physical hardware before
+it was tagged.
+
+## How this project was built
+
+MK1-Tank is a human–AI collaboration: a human project manager specified, bench-tested, and
+accepted every feature, working with Claude (Anthropic) as research and implementation
+manager and Claude Code as the coding agent. Every release was verified on physical
+hardware before being tagged. The design decisions, the test rig, and the tank are human;
+the keystrokes were shared.
 
 ## What it does
 
@@ -173,10 +240,3 @@ Apache License 2.0 - see [LICENSE](LICENSE), consistent with the
 the display driver, etc.) keep their own original licenses - see
 [NOTICE](NOTICE).
 
-## Photos
-
-<!-- PM: add real photos and remove this placeholder section -->
-- [ ] Front/side view of the assembled tank
-- [ ] Touchscreen dashboard, powered on
-- [ ] On-device editor mid-capture
-- [ ] Hub mounted in the model, address LED visible
