@@ -1,3 +1,18 @@
+<img width="2165" height="1624" alt="12" src="https://github.com/user-attachments/assets/0465fbc4-c844-4f62-b30d-54845e8178d1" />
+<img width="2151" height="1613" alt="11" src="https://github.com/user-attachments/assets/40f2a92c-8b3d-4e05-9959-4a50f029c761" />
+<img width="2175" height="1631" alt="10" src="https://github.com/user-attachments/assets/467b67f2-1099-4a17-98f2-0b538aad81a1" />
+<img width="2188" height="1641" alt="9" src="https://github.com/user-attachments/assets/f75519ae-60ac-4eb0-b415-7b787012c544" />
+<img width="2064" height="1548" alt="8" src="https://github.com/user-attachments/assets/733f1f18-d6d1-49e2-a2a5-7c42a12bca3e" />
+<img width="2119" height="1589" alt="7" src="https://github.com/user-attachments/assets/f4ea0132-50ef-4059-b91d-7a724ab5dfa2" />
+<img width="2011" height="1508" alt="6" src="https://github.com/user-attachments/assets/7bc48f76-6da9-4750-a8e3-940e5cb800be" />
+<img width="1974" height="1481" alt="5" src="https://github.com/user-attachments/assets/f987ada8-c4c5-4ed0-bad7-aaa75daa9b8d" />
+<img width="1569" height="2092" alt="4" src="https://github.com/user-attachments/assets/9dae4bde-7768-432f-a2a7-b1a5a4e51666" />
+<img width="1744" height="1308" alt="3" src="https://github.com/user-attachments/assets/3c911158-6c11-400b-8fd7-f664f6581103" />
+<img width="2326" height="1744" alt="2" src="https://github.com/user-attachments/assets/e993930e-7e35-4c13-975d-623cd1af487a" />
+<img width="1732" height="1299" alt="1" src="https://github.com/user-attachments/assets/7c274f2b-8c17-44a8-b2ad-aea0b6b140c2" />
+<img width="2229" height="1672" alt="13" src="https://github.com/user-attachments/assets/bdc216de-f6ed-4093-969e-31689ba0cb9a" />
+<img width="2174" height="1630" alt="14" src="https://github.com/user-attachments/assets/536dc834-4938-4620-8263-250b42fb2437" />
+<img width="2109" height="1582" alt="15" src="https://github.com/user-attachments/assets/55d0a214-b018-4dc4-bb4e-c30567423125" />
 # MK1-Tank
 
 Firmware for a custom LEGO Technic tank, built around an ESP32-S3 touchscreen
