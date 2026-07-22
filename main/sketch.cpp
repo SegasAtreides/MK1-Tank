@@ -10,6 +10,9 @@
 #include <Bluepad32.h>
 #include <Arduino_GFX_Library.h>
 
+#include "driver/gpio.h"
+#include "esp_sleep.h"
+
 #include "mkh_broadcast.h"
 #include "mkh_config.h"
 #include "mkh_ports.h"
@@ -226,6 +229,57 @@ static UiPage currentPage = PAGE_SPLASH;
 // session just because the user paused touching the screen).
 static uint32_t lastTouchActivityMs = 0;
 static const uint32_t IDLE_TIMEOUT_MS = 30000;
+
+// WO16: separate from lastTouchActivityMs above - marks when THIS idle-
+// screen visit began (set in drawIdlePage()), so the auto-sleep countdown
+// ("dashboard -> 30s -> idle screen -> N min -> deep sleep", per the
+// order's own chain) measures time spent ON the idle screen, not time
+// since the last touch (which already includes the 30s it took to get
+// here).
+static uint32_t idleEnteredMs = 0;
+
+// WO16 Phase 1 (wake-source investigation - schematic: Waveshare
+// ESP32-S3-Touch-LCD-2 official SchDoc.pdf, net list). Touch IRQ (TP_INT,
+// net NLTP0INT) traces to GPIO46 - NOT RTC-capable: the ESP32-S3's RTC/
+// LP-IO domain covers only GPIO0-21, and GPIO46 has no path to the RTC
+// controller, so it cannot be used with esp_sleep_enable_ext0/ext1_wakeup.
+// This is an SoC-level constraint, not a wiring choice - option (a) from
+// the order is infeasible regardless of firmware. The onboard BOOT key
+// (Key2, schematic net NLBOOT) traces to GPIO0 - one of the RTC-capable
+// pins, idling HIGH via the board's own pull-up (the same strap the SoC
+// itself samples at reset to pick "run from flash") and pulled to GND by
+// Key2 on press. That's option (b), and it's what this build uses.
+//
+// GPIO0 is ALSO this project's TFT_RST (see the display pin block above,
+// and the schematic - NLIO0/NLLCD0RST/NLBOOT are literally the same net):
+// the display driver drives it as a push-pull output, left HIGH, after
+// display->begin()'s reset pulse (see initDisplay()). enterDeepSleep()
+// below explicitly hands the pin back to plain INPUT before arming ext0
+// wake, so the RTC controller - not the display driver's output stage -
+// owns the pad while asleep. Harmless: the backlight is off by then, so
+// nothing the panel's own GRAM/reset state does is visible regardless.
+//
+// Consequence worth flagging plainly: the order's target "tap-anywhere-
+// on-dark-screen" wake UX was contingent on option (a) working. It
+// doesn't, so the real wake gesture is a press of the physical BOOT key,
+// not a screen tap.
+#define MKH_WAKE_GPIO GPIO_NUM_0
+
+// Order: "suggest 10 min, report chosen value" - kept at the suggestion.
+static const uint32_t AUTO_SLEEP_TIMEOUT_MS = 10UL * 60UL * 1000UL;
+
+// WO16: how long the idle screen's SLEEP control must be held (not just
+// tapped) before it triggers deep sleep - long enough that the same quick
+// tap which would otherwise wake the dashboard can never accidentally
+// trigger it too.
+static const uint32_t SLEEP_HOLD_MS = 1500;
+
+// WO16: idle-screen SLEEP control hold-tracking. Set when a NEW press
+// (mkh_touch_poll()'s edge-triggered return) lands inside the SLEEP hit-
+// zone while idling; cleared on release, on a fresh idle-page entry, or
+// once consumed by an actual sleep-entry decision - all in loop() below.
+static bool idleSleepHoldActive = false;
+static uint32_t idleSleepHoldStartMs = 0;
 
 // WO10 Step 1: editing context - selection state only (no pending
 // values yet - that's a later step). selected_valid is the "nothing
@@ -892,6 +946,14 @@ static const uint32_t IDLE_ANIM_INTERVAL_MS = 500;
 static uint32_t idleAnimLastTickMs = 0;
 static int idleAnimFrame = 0;
 
+// WO16: SLEEP control - sits clear of the tank/track art (which occupies
+// down to y=196, see drawIdleTank()) and away from the right/bottom
+// screen edges.
+static const int16_t IDLE_SLEEP_BTN_X = 210;
+static const int16_t IDLE_SLEEP_BTN_Y = 198;
+static const int16_t IDLE_SLEEP_BTN_W = 96;
+static const int16_t IDLE_SLEEP_BTN_H = 38;
+
 static void drawIdleTank() {
     const int16_t hullX = 110, hullY = 150, hullW = 100, hullH = 30;
     const int16_t turretX = 140, turretY = 122, turretW = 45, turretH = 28;
@@ -925,10 +987,30 @@ static void drawIdlePage() {
     display->setTextSize(2);
     display->setCursor((SCR_W - textWidth(title, 2)) / 2, 20);
     display->print(title);
+
+    // WO16: subtle, static one-line hint for the two idle-screen gestures
+    // - ASCII hyphen, not a middle-dot, since the display's built-in
+    // bitmap font isn't guaranteed to have that glyph (same call as the
+    // WO10 capture-page title).
+    const char* hint = "hold SLEEP to power down - press BOOT key to wake";
+    display->setTextColor(COLOR_CARD_BORDER);
+    display->setTextSize(1);
+    display->setCursor((SCR_W - textWidth(hint, 1)) / 2, 44);
+    display->print(hint);
+
     drawIdleTank();
     idleAnimFrame = 0;
     idleAnimLastTickMs = millis();
     drawIdlePuffFrame(idleAnimFrame);
+
+    drawButtonAt(IDLE_SLEEP_BTN_X, IDLE_SLEEP_BTN_Y, IDLE_SLEEP_BTN_W, IDLE_SLEEP_BTN_H, "SLEEP");
+
+    // WO16: fresh state on every idle-page entry - the auto-sleep clock
+    // restarts, and any in-progress hold from a previous idle visit
+    // (shouldn't be possible to carry over, but this makes it structurally
+    // impossible rather than relying on that) is cleared.
+    idleEnteredMs = millis();
+    idleSleepHoldActive = false;
 }
 
 // Called from loop() only while currentPage == PAGE_IDLE. Cheap - a
@@ -3145,10 +3227,19 @@ static void checkCapture() {
 
 // Arduino setup function. Runs in CPU 1
 void setup() {
+    // WO16: log the wakeup cause before anything else - proves (from the
+    // boot log alone) whether this boot is a fresh power-on/reset or a
+    // return from deep sleep via the BOOT-key wake, per the order's own
+    // wake self-test/acceptance criteria ("tap -> boots to dashboard").
+    esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+    Console.printf("MK1 Boot: wakeup cause=%d (%s)\n", (int)wakeCause,
+                    wakeCause == ESP_SLEEP_WAKEUP_EXT0 ? "EXT0 BOOT-key wake from deep sleep" : "power-on/other reset");
+
     // v0.8.0 Step 0b: LittleFS storage foundation. Internal flash has no
     // shared-bus constraint with the display (unlike the retired SD
-    // path - see mkh_sdcard.cpp), but this stays the first line of
-    // setup() to preserve the single-entry-point boot discipline.
+    // path - see mkh_sdcard.cpp); this stays the first STORAGE/hardware
+    // action of setup() (only the WO16 wake-cause log above it, which
+    // touches nothing) to preserve the single-entry-point boot discipline.
     mkh_storage_boot_read();
 
     // v0.9.0 Step 0: CST816D touch bring-up. Independent I2C bus (SDA=48,
@@ -3247,6 +3338,69 @@ static int touchYToDeviceId(int16_t displayY) {
 // per device so rapid taps on different rows are never cross-debounced.
 static const uint32_t MKH_TOGGLE_DEBOUNCE_MS = 200;
 static uint32_t lastToggleMs[MKH_MK6_NUM_DEVICES] = {0, 0, 0};
+
+// WO16: sleep entry - reached either from the idle screen's SLEEP hold
+// gesture or the auto-sleep timer (both in loop() below). Never returns
+// on success (esp_deep_sleep_start() halts the CPU); the only way back is
+// a full reboot via the BOOT-key wake (see MKH_WAKE_GPIO's doc comment
+// above for why touch can't be the wake source).
+//
+// Mandatory sequence per the order: neutral to every hub BEFORE anything
+// else, wait for that to actually finish airing, THEN blank the display,
+// THEN deep sleep. Reuses mkh_broadcast_toggle_off() - the same safety-
+// ordered "command neutral now, keep airing it for a few more services,
+// then drop" primitive the dashboard's own per-hub OFF button already
+// uses (mkh_broadcast.c/mkh_protocol.c/.h untouched) - rather than
+// inventing a second path to the same guarantee.
+static void enterDeepSleep() {
+    Console.printf("MK1 Sleep: entry requested, commanding neutral to all hubs before shutdown\n");
+
+    for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++) {
+        mkh_broadcast_toggle_off(d);
+    }
+
+    // Poll for the neutral-then-drop sequence to actually finish (WO12's
+    // event-driven send means the neutral COMMAND is usually already on
+    // air within ~25ms of the toggle_off calls above, but this also waits
+    // for the full OFF-grace drop, so the log line below reports what
+    // actually happened, not just what was requested). Bounded: if a
+    // device somehow never clears, sleep still proceeds after the
+    // timeout rather than hanging forever - the neutral command itself
+    // already went out synchronously inside toggle_off() regardless of
+    // whether the drop bookkeeping ever completes.
+    const uint32_t NEUTRAL_WAIT_TIMEOUT_MS = 2000;
+    uint32_t waitStart = millis();
+    bool allClear = false;
+    while (millis() - waitStart < NEUTRAL_WAIT_TIMEOUT_MS) {
+        allClear = true;
+        for (int d = 0; d < MKH_MK6_NUM_DEVICES; d++) {
+            if (mkh_hub_broadcasting[d] || mkh_broadcast_is_transitioning(d)) {
+                allClear = false;
+                break;
+            }
+        }
+        if (allClear)
+            break;
+        delay(20);
+    }
+    Console.printf("MK1 Sleep: broadcast stop %s (%lums)\n",
+                    allClear ? "confirmed clean - all hubs neutral and dropped" : "timed out, proceeding anyway",
+                    (unsigned long)(millis() - waitStart));
+
+    digitalWrite(TFT_BL, LOW);
+    display->fillScreen(COLOR_BG);
+
+    // WO16 Phase 1 finding: GPIO0 is shared between TFT_RST (currently
+    // driven HIGH by the display driver) and the BOOT-key wake source.
+    // Hand it back to plain INPUT before the RTC controller takes
+    // ownership for ext0 wake - harmless, since the backlight is already
+    // off by this point.
+    pinMode(TFT_RST, INPUT);
+
+    esp_sleep_enable_ext0_wakeup(MKH_WAKE_GPIO, 0);  // wake on LOW (BOOT key press)
+    Console.printf("MK1 Sleep: display off, entering deep sleep now (wake source = BOOT key / GPIO0 LOW)\n");
+    esp_deep_sleep_start();
+}
 
 // Arduino loop function. Runs in CPU 1.
 void loop() {
@@ -3396,12 +3550,25 @@ void loop() {
             // code under this order's single-pass scope).
             dispatchSettingsTouch(touchX, touchY);
         } else if (currentPage == PAGE_IDLE) {
-            // WO11 Task 3: any touch wakes instantly, straight to the
-            // dashboard - no sub-regions, matching the order's "any touch
-            // returns to dashboard instantly."
-            Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> idle screen, waking to dashboard\n", touchX,
-                            touchY);
-            goToPage(PAGE_DASHBOARD);
+            // WO16: a NEW press starting inside the SLEEP button no
+            // longer wakes immediately - it arms the hold-to-sleep timer
+            // instead (checked every tick further down in loop(), via
+            // mkh_touch_is_pressed() rather than this edge-triggered
+            // return, since a hold needs continuous state). Any other
+            // tap keeps WO11's original "any touch wakes instantly"
+            // behavior unchanged.
+            bool inSleepBtn = touchX >= IDLE_SLEEP_BTN_X && touchX < IDLE_SLEEP_BTN_X + IDLE_SLEEP_BTN_W &&
+                               touchY >= IDLE_SLEEP_BTN_Y && touchY < IDLE_SLEEP_BTN_Y + IDLE_SLEEP_BTN_H;
+            if (inSleepBtn) {
+                Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> SLEEP button, hold-to-sleep armed\n", touchX,
+                                touchY);
+                idleSleepHoldActive = true;
+                idleSleepHoldStartMs = millis();
+            } else {
+                Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> idle screen, waking to dashboard\n", touchX,
+                                touchY);
+                goToPage(PAGE_DASHBOARD);
+            }
         }
     }
 
@@ -3414,6 +3581,11 @@ void loop() {
     // broadcast/slicer/failsafe/XWC-processing/config touches.
     if (currentPage == PAGE_DASHBOARD && xwcState != XWC_ACTIVE &&
         (millis() - lastTouchActivityMs) >= IDLE_TIMEOUT_MS) {
+        // WO16: log the transition itself (WO11 never did) - needed to
+        // log-verify the auto-sleep chain's first link from the boot log
+        // alone.
+        Console.printf("MK1 Idle: %lums since last touch, no XWC - entering idle screen\n",
+                        (unsigned long)(millis() - lastTouchActivityMs));
         goToPage(PAGE_IDLE);
     }
 
@@ -3427,7 +3599,38 @@ void loop() {
         // "if XWC connects while idling, wake to dashboard."
         updateIdleAnimation();
         if (xwcState == XWC_ACTIVE) {
+            // An active controller connection always wins, even over an
+            // in-progress SLEEP hold - matches WO11's original priority
+            // (idling is never allowed to block a live control session).
             goToPage(PAGE_DASHBOARD);
+        } else if (idleSleepHoldActive) {
+            // WO16: hold-to-sleep in progress - checked every tick via
+            // mkh_touch_is_pressed() (continuous state), not
+            // mkh_touch_poll()'s return (edge-triggered, already consumed
+            // above).
+            if (!mkh_touch_is_pressed()) {
+                // Released before the hold threshold - the order's own
+                // accidental-activation guard: treat it exactly like any
+                // other tap on the idle screen and just wake, the same as
+                // if the tap had landed anywhere else.
+                Console.printf("MK1 Sleep: SLEEP hold released early (%lums) - waking to dashboard instead\n",
+                                (unsigned long)(millis() - idleSleepHoldStartMs));
+                idleSleepHoldActive = false;
+                goToPage(PAGE_DASHBOARD);
+            } else if (millis() - idleSleepHoldStartMs >= SLEEP_HOLD_MS) {
+                Console.printf("MK1 Sleep: SLEEP held for %lums - entering deep sleep\n",
+                                (unsigned long)SLEEP_HOLD_MS);
+                idleSleepHoldActive = false;
+                enterDeepSleep();  // never returns
+            }
+        } else if ((millis() - idleEnteredMs) >= AUTO_SLEEP_TIMEOUT_MS) {
+            // WO16 auto-sleep: "dashboard -> 30s -> idle screen -> N min
+            // -> deep sleep." Armed only here (currentPage == PAGE_IDLE)
+            // and only when XWC is not active - guaranteed by this
+            // being the trailing else-if under the XWC_ACTIVE check above.
+            Console.printf("MK1 Sleep: auto-sleep timeout (%lu min idle, no touch, no XWC) - entering deep sleep\n",
+                            (unsigned long)(AUTO_SLEEP_TIMEOUT_MS / 60000UL));
+            enterDeepSleep();  // never returns
         }
     } else if (currentPage == PAGE_EDIT_CAPTURE && !capturePromptActive) {
         // WO10 Step 2: capture-token detection runs every tick while

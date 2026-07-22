@@ -32,6 +32,16 @@ void mkh_touch_init(void);
 // poll while a finger stays down.
 bool mkh_touch_poll(int16_t* outDisplayX, int16_t* outDisplayY);
 
+// WO16: true if a finger is currently down, independent of
+// mkh_touch_poll()'s edge-triggered "new press" contract above. Reflects
+// the most recent PRESS/MOVE/RELEASE sample mkh_touch_poll() processed -
+// used by hold-to-trigger gestures (the idle screen's SLEEP control) that
+// need to track press duration across multiple loop() ticks, not just the
+// initial press moment. Since mkh_touch_poll() runs unconditionally every
+// loop() tick regardless of which page's return value is acted on, this
+// stays accurate even across page transitions.
+bool mkh_touch_is_pressed(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -218,3 +218,7 @@ bool mkh_touch_poll(int16_t* outDisplayX, int16_t* outDisplayY) {
     }
     return false;
 }
+
+bool mkh_touch_is_pressed(void) {
+    return s_wasPressed;
+}
