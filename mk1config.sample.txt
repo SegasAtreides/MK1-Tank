@@ -18,7 +18,7 @@
 # Format: one line per BINDING (WO13: a port can carry more than one -
 # see below). Repeated lines for the same port ACCUMULATE rather than
 # replace, up to 8 bindings per port.
-#   HUB<n>_PORT_<letter> = <input> [invert=yes|no] [max=0-100] [curve=linear] [mode=proportional|momentary|latched]
+#   HUB<n>_PORT_<letter> = <input> [invert=yes|no] [max=0-100] [curve=linear] [mode=proportional|momentary|latched|pulse]
 #
 # HUB<n>: app-facing hub number, 1-3, matching the hub's own blue-flash
 #         LED blink count when you set its address (HUB1/2/3, not the
@@ -42,8 +42,13 @@
 # mode:   only meaningful for non-axis inputs (ignored for LSNS/LSEW/
 #         RSNS/RSEW). "proportional" (triggers only), "momentary"
 #         (default for buttons/D-pad/stick-clicks - port follows the
-#         press), or "latched" (each press toggles the port and holds
-#         it; runtime-only, always boots off).
+#         press), "latched" (each press toggles the port and holds
+#         it; runtime-only, always boots off), or "pulse" (each press
+#         emits one fixed-duration full-level burst then returns to
+#         neutral on its own - taps during an active pulse are
+#         ignored, no queue/retrigger/extension; duration is a
+#         compile-time constant, main/sketch.cpp's MKH_PULSE_FRAMES,
+#         bench-tunable, 400ms by default).
 #
 # Lines starting with # are comments (this file's own schema-version line
 # is one). Blank lines are ignored. Unknown keys or malformed lines are
@@ -73,3 +78,9 @@ HUB2_PORT_A = RSNS invert=no max=100 curve=linear
 # (commented out - repeated lines for the same port accumulate):
 # HUB1_PORT_E = RSNS invert=no max=100 curve=linear
 # HUB1_PORT_E = A mode=momentary
+
+# Example of a pulse invert-pair (commented out) - the canonical PULSE
+# config: LB nudges a gearbox selector motor one gate "up", RB nudges it
+# one gate "down", each tap driving exactly one fixed-duration burst:
+# HUB1_PORT_F = LB mode=pulse
+# HUB1_PORT_F = RB mode=pulse invert=yes

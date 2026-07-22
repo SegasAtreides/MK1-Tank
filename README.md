@@ -91,7 +91,7 @@ the keystrokes were shared.
   sticks, both triggers, all four face buttons, both bumpers, the D-pad, and
   both stick clicks) to any hub port - each port can carry several
   alternative bindings - with per-binding invert, output-range cap, and
-  proportional/momentary/latched mode, all from the touchscreen. A
+  proportional/momentary/latched/pulse mode, all from the touchscreen. A
   confirm-gated reset-all wipes every binding back to a blank slate.
 - Config is saved to internal flash (LittleFS) and survives reboot/power loss.
 - Dashboard shows live per-hub broadcast state, XWC connection state, and
@@ -164,7 +164,7 @@ zero so the common case just works). Repeated lines for the same port
 accumulate rather than replace:
 
 ```
-HUB<n>_PORT_<letter> = <input> [invert=yes|no] [max=0-100] [curve=linear] [mode=proportional|momentary|latched]
+HUB<n>_PORT_<letter> = <input> [invert=yes|no] [max=0-100] [curve=linear] [mode=proportional|momentary|latched|pulse]
 ```
 
 - `HUB<n>` - app-facing hub number, 1-3, matching the hub's own blue-flash
@@ -179,9 +179,15 @@ HUB<n>_PORT_<letter> = <input> [invert=yes|no] [max=0-100] [curve=linear] [mode=
   unsupported and treated as linear.
 - `mode` - only meaningful for non-axis inputs (triggers/buttons/D-pad/stick
   clicks); ignored for the two stick axes. `proportional` (triggers only),
-  `momentary` (default for buttons - port follows the press), or `latched`
+  `momentary` (default for buttons - port follows the press), `latched`
   (each press toggles the port's output and holds it, runtime-only state,
-  always boots off).
+  always boots off), or `pulse` (each press-edge emits one fixed-duration
+  full-level burst, then the port returns to neutral on its own - holding
+  or releasing the input doesn't matter, and taps during an active pulse
+  are ignored rather than queued/retriggering/extending it; duration is a
+  compile-time constant, `MKH_PULSE_FRAMES` in `main/sketch.cpp`, 4 frames
+  of 100ms = 400ms by default, meant to be bench-tuned). Editor: `pulse` is
+  offered for button-class inputs only, not stick axes.
 
 Lines starting with `#` are comments (the file's own first line records a
 schema version this way) and blank lines are ignored. Unknown keys or

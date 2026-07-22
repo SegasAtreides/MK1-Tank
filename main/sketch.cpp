@@ -1844,16 +1844,23 @@ static const char* modeShortLabel(mkh_input_mode_t mode) {
             return "MOMENTARY";
         case MKH_MODE_LATCHED:
             return "LATCHED";
+        case MKH_MODE_PULSE:
+            return "PULSE";
         default:
             return "?";
     }
 }
 
-// 2-state cycle for digitals (MOMENTARY<->LATCHED - no proportional
-// option, order: "buttons/dpad/stick-clicks = momentary (default) |
-// latched"); 3-state cycle for triggers (PROPORTIONAL->MOMENTARY->
-// LATCHED->...). Never called for MKH_INPUT_CLASS_AXIS - that row is
-// hidden entirely (order: "hidden/disabled for stick axes").
+// 3-state cycle for digitals (MOMENTARY->LATCHED->PULSE->... - no
+// proportional option, order: "buttons/dpad/stick-clicks = momentary
+// (default) | latched", extended by the PULSE WO to add pulse as a
+// third button-class option); 4-state cycle for triggers
+// (PROPORTIONAL->MOMENTARY->LATCHED->PULSE->...) - "triggers-as-buttons"
+// per the PULSE WO's own context line, so triggers get the same third
+// option digitals do, on top of their existing proportional default.
+// Never called for MKH_INPUT_CLASS_AXIS - that row is hidden entirely
+// (order: "hidden/disabled for stick axes"; PULSE WO: "sticks/axes: not
+// offered", same treatment, no new row needed).
 static mkh_input_mode_t nextModeFor(mkh_input_class_t cls, mkh_input_mode_t current) {
     if (cls == MKH_INPUT_CLASS_TRIGGER) {
         switch (current) {
@@ -1861,11 +1868,20 @@ static mkh_input_mode_t nextModeFor(mkh_input_class_t cls, mkh_input_mode_t curr
                 return MKH_MODE_MOMENTARY;
             case MKH_MODE_MOMENTARY:
                 return MKH_MODE_LATCHED;
+            case MKH_MODE_LATCHED:
+                return MKH_MODE_PULSE;
             default:
                 return MKH_MODE_PROPORTIONAL;
         }
     }
-    return (current == MKH_MODE_LATCHED) ? MKH_MODE_MOMENTARY : MKH_MODE_LATCHED;
+    switch (current) {
+        case MKH_MODE_MOMENTARY:
+            return MKH_MODE_LATCHED;
+        case MKH_MODE_LATCHED:
+            return MKH_MODE_PULSE;
+        default:
+            return MKH_MODE_MOMENTARY;
+    }
 }
 
 // WO10-FINAL rev B mode control: CC's widget judgment (reported) - a
@@ -2644,18 +2660,97 @@ static uint8_t mkTriggerToChannelByte(int32_t triggerValue) {
 static bool latchState[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDINGS_PER_PORT];
 static bool latchPrevPressed[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDINGS_PER_PORT];
 
-// WO11 Task 4 (hardening), extended WO13: reassigning a port away from
-// latched mode and back again via the editor could otherwise resurface a
-// stale latchState value from before the reassignment - a port pushed
-// through pushPendingSessionToLiveTable() (Test-ON/Save) always gets a
-// fresh, unlatched start for EVERY binding slot, same "boots off"
-// guarantee the order gives config itself. Forward-declared above (near
-// clearEditorSession()) so pushPendingSessionToLiveTable(), defined
-// earlier in the file, can call it.
+// WO: PULSE (v1.3.0), AMENDED to frame-count timing (supersedes an
+// earlier millis()-duration draft). One press-edge ARMS a pulse; it
+// starts at the next frame boundary, runs exactly MKH_PULSE_FRAMES
+// consecutive full-level frames, and returns to neutral at the boundary
+// after - never a partial frame in either direction. See mkh_config.h's
+// MKH_MODE_PULSE doc comment for the full behavior spec.
+//
+// Frame interval T: this project has no single hardware "frame clock" to
+// hook - the broadcast layer is a hybrid of a ~100ms periodic re-arm
+// (mkh_broadcast.c's MKH_CONTROL_REPEAT_MS, private to that file) and
+// WO12's event-driven out-of-turn sends. Per the order's hard constraint
+// (broadcast timing/slicer untouched, no new coupling into
+// mkh_broadcast.c), T is a virtual, INPUT-SIDE clock derived purely from
+// millis() - frame number = millis() / MKH_FRAME_INTERVAL_MS - not a
+// signal read back from the broadcast module. The 100ms value is a
+// hand-synced mirror of MKH_CONTROL_REPEAT_MS, same restatement pattern
+// this file already uses for MK1_TELEGRAM_RATE_LABEL above (see its own
+// doc comment: "restated here rather than derived, since those are
+// private constants inside a file WO11 requires zero changes to").
+//
+//     *** T = MKH_FRAME_INTERVAL_MS = 100ms ***
+//     *** PULSE duration: MKH_PULSE_FRAMES = 4 frames = 400ms ***
+//     *** both sketch.cpp, bench-tunable ***
+//
+#define MKH_FRAME_INTERVAL_MS 100
+#define MKH_PULSE_FRAMES 4
+
+// Same per-binding shape as latchState/latchPrevPressed above, same
+// reason (a port can carry several bindings, each independently in
+// momentary/latched/pulse/proportional mode).
+//   pulseArmed:      press-edge seen, waiting for the next frame
+//                    boundary to actually start (this is what makes
+//                    start "frame-boundary synchronized" rather than
+//                    immediate-on-press).
+//   pulseArmedFrame: the frame number arming happened on - the pulse
+//                    starts on the first LATER tick where the current
+//                    frame number differs from this, i.e. the next
+//                    boundary crossing, never mid-frame.
+//   pulseActive:     a pulse window is currently open (emitting full
+//                    level).
+//   pulseStartFrame: the frame number the active window started on -
+//                    it runs while currentFrame < pulseStartFrame +
+//                    MKH_PULSE_FRAMES and ends (neutral) the instant
+//                    that stops holding, which is itself always a
+//                    boundary crossing since currentFrame only ever
+//                    changes at one.
+//   pulsePrevPressed: the press-edge detector, same pattern as
+//                    latchPrevPressed. Per the order, a press-edge
+//                    arriving while EITHER armed or active is the
+//                    lockout case ("lockout holds until the neutral
+//                    boundary"): pulsePrevPressed still updates (so the
+//                    next genuine edge is detected correctly once the
+//                    pulse ends) but nothing else changes - no new arm,
+//                    no retrigger, no extension.
+static bool pulseArmed[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDINGS_PER_PORT];
+static uint32_t pulseArmedFrame[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDINGS_PER_PORT];
+static bool pulseActive[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDINGS_PER_PORT];
+static uint32_t pulseStartFrame[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDINGS_PER_PORT];
+static bool pulsePrevPressed[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDINGS_PER_PORT];
+
+// WO11 Task 4 (hardening), extended WO13, extended WO PULSE: reassigning
+// a port away from latched/pulse mode and back again via the editor
+// could otherwise resurface stale state from before the reassignment - a
+// port pushed through pushPendingSessionToLiveTable() (Test-ON/Save)
+// always gets a fresh, unlatched/unpulsed start for EVERY binding slot,
+// same "boots off" guarantee the order gives config itself. Forward-
+// declared above (near clearEditorSession()) so
+// pushPendingSessionToLiveTable(), defined earlier in the file, can call
+// it.
+//
+// WO PULSE: despite the name (kept as-is rather than renamed across
+// every call site for a purely cosmetic reason), this now also clears
+// pulse runtime state - latched and pulsed are both "runtime-only,
+// reset on the same triggers" (port reassignment, controller disconnect
+// failsafe, RESET ALL), so folding pulse-clearing into the existing
+// function reuses that identical lifecycle instead of adding a parallel
+// clearPulseStateForPort() that every latch call site would also need to
+// call. Failsafe requirement satisfied here too: onDisconnectedController()
+// already calls clearAllLatchState() unconditionally on every XWC
+// disconnect, immediately after neutralizing every assigned channel - an
+// active pulse's internal bookkeeping is cleared in that same sweep, so a
+// reconnect can never resume mid-pulse.
 static void clearLatchStateForPort(int dev, int port) {
     for (int b = 0; b < MKH_MAX_BINDINGS_PER_PORT; b++) {
         latchState[dev][port][b] = false;
         latchPrevPressed[dev][port][b] = false;
+        pulseArmed[dev][port][b] = false;
+        pulseArmedFrame[dev][port][b] = 0;
+        pulseActive[dev][port][b] = false;
+        pulseStartFrame[dev][port][b] = 0;
+        pulsePrevPressed[dev][port][b] = false;
     }
 }
 
@@ -2742,6 +2837,12 @@ static int32_t readTokenRaw(ControllerPtr ctl, mkh_input_source_t token) {
 // actually being touched" when only one is, and correctly adds when more
 // than one is touched at once, exactly as ordered.
 static void processMappedInputs(ControllerPtr ctl) {
+    // WO PULSE: one virtual frame number for this whole sweep, so every
+    // binding evaluated in this call sees a consistent boundary - see
+    // MKH_FRAME_INTERVAL_MS's doc comment above for what "frame" means
+    // here (a millis()-derived virtual clock, not a broadcast-layer signal).
+    uint32_t currentFrame = (uint32_t)(millis() / MKH_FRAME_INTERVAL_MS);
+
     for (int dev = 0; dev < MKH_MK6_NUM_DEVICES; dev++) {
         for (int port = 0; port < MKH_MK6_NUM_CHANNELS; port++) {
             const mkh_port_config_t* cfg = mkh_config_get(dev, port);
@@ -2783,6 +2884,50 @@ static void processMappedInputs(ControllerPtr ctl) {
                         }
                         latchPrevPressed[dev][port][bIdx] = pressed;
                         rawByte = latchState[dev][port][bIdx] ? 0xFF : 0x80;
+                    } else if (binding->mode == MKH_MODE_PULSE) {
+                        // WO PULSE: press-edge arms; lockout covers BOTH
+                        // armed and active (a tap while either is true is
+                        // ignored - "no queue, no retrigger, no
+                        // extension"); start/end only ever happen on a
+                        // frame-boundary crossing (currentFrame actually
+                        // changing value), never mid-frame.
+                        bool isNewPress = pressed && !pulsePrevPressed[dev][port][bIdx];
+                        pulsePrevPressed[dev][port][bIdx] = pressed;
+
+                        if (isNewPress) {
+                            if (!pulseArmed[dev][port][bIdx] && !pulseActive[dev][port][bIdx]) {
+                                pulseArmed[dev][port][bIdx] = true;
+                                pulseArmedFrame[dev][port][bIdx] = currentFrame;
+                                Console.printf(
+                                    "MK1 Pulse: dev=%d port=%c[%d] armed at frame=%lu (starts next boundary)\n", dev,
+                                    mkh_port_letter(port), bIdx, (unsigned long)currentFrame);
+                            } else {
+                                Console.printf(
+                                    "MK1 Pulse: dev=%d port=%c[%d] tap ignored - lockout (armed=%d active=%d)\n", dev,
+                                    mkh_port_letter(port), bIdx, (int)pulseArmed[dev][port][bIdx],
+                                    (int)pulseActive[dev][port][bIdx]);
+                            }
+                        }
+
+                        if (pulseArmed[dev][port][bIdx] && currentFrame != pulseArmedFrame[dev][port][bIdx]) {
+                            // First tick in a later frame than arming -
+                            // the next boundary has arrived. Start now.
+                            pulseArmed[dev][port][bIdx] = false;
+                            pulseActive[dev][port][bIdx] = true;
+                            pulseStartFrame[dev][port][bIdx] = currentFrame;
+                            Console.printf("MK1 Pulse: dev=%d port=%c[%d] START frame=%lu (%d frames, %dms)\n", dev,
+                                           mkh_port_letter(port), bIdx, (unsigned long)currentFrame, MKH_PULSE_FRAMES,
+                                           MKH_PULSE_FRAMES * MKH_FRAME_INTERVAL_MS);
+                        }
+
+                        if (pulseActive[dev][port][bIdx] &&
+                            currentFrame >= pulseStartFrame[dev][port][bIdx] + (uint32_t)MKH_PULSE_FRAMES) {
+                            pulseActive[dev][port][bIdx] = false;
+                            Console.printf("MK1 Pulse: dev=%d port=%c[%d] END frame=%lu, neutral\n", dev,
+                                           mkh_port_letter(port), bIdx, (unsigned long)currentFrame);
+                        }
+
+                        rawByte = pulseActive[dev][port][bIdx] ? 0xFF : 0x80;
                     } else {
                         // MOMENTARY - the only other legal mode for a
                         // digital; for a trigger, the explicit momentary case.
@@ -2973,15 +3118,21 @@ void dumpBalanceBoard(ControllerPtr ctl) {
 }
 
 void processGamepad(ControllerPtr ctl) {
-    if (ctl->index() == 0) {
-        // v0.8.0 Step 2 / WO10-FINAL rev B: which device/port slot(s)
-        // each token drives is resolved at runtime from the config
-        // table (mkh_config_get()) - see processMappedInputs() above
-        // for the full 18-token, mode-aware sweep. Default config still
-        // reproduces v0.7.0 exactly (HUB1 port A = LSNS, HUB2 port A =
-        // RSNS, invert=no, max=100, proportional).
-        processMappedInputs(ctl);
-    }
+    // v0.8.0 Step 2 / WO10-FINAL rev B: which device/port slot(s) each
+    // token drives is resolved at runtime from the config table
+    // (mkh_config_get()) - see processMappedInputs() for the full
+    // 18-token, mode-aware sweep.
+    //
+    // WO PULSE: the actual call moved OUT of here (was: "if
+    // ctl->index()==0, processMappedInputs(ctl)" right in this spot) to
+    // loop(), where it now runs unconditionally every tick instead of
+    // only when BP32.update() reports fresh data - see loop()'s own
+    // comment for why (PULSE's frame-boundary START/END transitions are
+    // pure time-based state, not edge-triggered, so they need to be
+    // re-checked even on ticks with no new controller report; bench-
+    // verified this matters - a real gap between reports, entirely
+    // ordinary BLE HID behavior, delayed a pulse's neutral transition
+    // by ~700ms past its nominal 400ms in testing before this fix).
 
     // There are different ways to query whether a button is pressed.
     // By query each button individually:
@@ -3439,6 +3590,25 @@ void loop() {
     bool dataUpdated = BP32.update();
     if (dataUpdated)
         processControllers();
+
+    // WO PULSE: processMappedInputs() runs here unconditionally, every
+    // tick, regardless of dataUpdated - moved out of processGamepad()
+    // (see its own comment) specifically so PULSE's frame-boundary
+    // START/END transitions - pure millis()-derived state, not tied to
+    // a controller edge - can't be delayed by a quiet stretch in the
+    // controller's own report cadence. This is a strict superset of the
+    // old "only on dataUpdated" gating (same ticks, plus more), and
+    // idempotent for MOMENTARY/LATCHED - re-evaluating unchanged
+    // pressed/released state with the same inputs reproduces the same
+    // output, never a spurious extra toggle or edge (both key on
+    // pulsePrevPressed/latchPrevPressed already being in sync with the
+    // current pressed value on any repeat call). Guarded on
+    // myControllers[0] existing - nothing to sweep with no XWC connected,
+    // and onDisconnectedController()'s failsafe already neutralizes and
+    // clears all runtime mode state the instant it goes away.
+    if (myControllers[0]) {
+        processMappedInputs(myControllers[0]);
+    }
 
     // WO13 Task 3: battery ADC read - runs every tick regardless of
     // page, gated internally to its own ~1s interval (see

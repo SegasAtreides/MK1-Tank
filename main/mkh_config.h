@@ -83,10 +83,26 @@ mkh_input_class_t mkh_config_input_class(mkh_input_source_t input);
 // per the order) rather than rejected at parse time; the drive sweep
 // simply never consults mode for an axis-class port, which keeps the
 // parser's attribute handling uniform across all token types.
+// WO: PULSE (v1.3.0) adds MKH_MODE_PULSE - a third button-class mode
+// alongside momentary/latched. One press-edge emits one fixed-duration
+// full-level burst then self-terminates to neutral; taps during an
+// active pulse are ignored (no queue/retrigger/extension - "pulses are
+// atomic"). See sketch.cpp's MKH_PULSE_DURATION_MS (the bench-tunable
+// duration constant) and processMappedInputs() for the state machine.
+// Like LATCHED, PULSE is opt-in only (default_mode_for_input() in
+// mkh_config.c never resolves to it) and offered for button-class inputs
+// only - buttons/bumpers/dpad/stick-clicks (MKH_INPUT_CLASS_DIGITAL) and
+// triggers used as buttons (MKH_INPUT_CLASS_TRIGGER, non-proportional).
+// Same "meaningless but harmless" treatment as the other non-proportional
+// modes on an axis binding - the parser accepts mode=pulse for any token
+// uniformly (see mkh_config_parse_line()'s doc comment), it's simply
+// never consulted for MKH_INPUT_CLASS_AXIS at drive time; the "sticks:
+// not offered" restriction is editor-UI-only, per the order.
 typedef enum {
     MKH_MODE_PROPORTIONAL = 0,
     MKH_MODE_MOMENTARY,
     MKH_MODE_LATCHED,
+    MKH_MODE_PULSE,
 } mkh_input_mode_t;
 
 // WO13: a port carries up to this many bindings. Soft cap - trivially
