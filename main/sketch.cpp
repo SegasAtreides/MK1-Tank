@@ -2685,7 +2685,7 @@ static bool latchPrevPressed[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_
 //     *** both sketch.cpp, bench-tunable ***
 //
 #define MKH_FRAME_INTERVAL_MS 100
-#define MKH_PULSE_FRAMES 4
+#define MKH_PULSE_FRAMES 1
 
 // Same per-binding shape as latchState/latchPrevPressed above, same
 // reason (a port can carry several bindings, each independently in
