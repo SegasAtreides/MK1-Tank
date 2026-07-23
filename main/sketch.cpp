@@ -1451,9 +1451,22 @@ static int16_t portCellY(int row) {
     return PORT_GRID_Y0 + row * (PORT_GRID_ROW_H + PORT_GRID_ROW_GAP);
 }
 
+// WO20 (rev A): port-select now mirrors the physical hub's own layout,
+// held power-button-left - top row B/D/F, bottom row A/C/E left to
+// right, paired into columns A/B, C/D, E/F (see drawPortSelect()'s red
+// dot, the non-interactive power-button anchor this layout is oriented
+// against). Geometry (portCellX/Y, cell size, hit-zone size) is
+// UNCHANGED from before - only which port maps to which (col,row) cell
+// moved. A(0)/C(2)/E(4) (even index) are the bottom row; B(1)/D(3)/F(5)
+// (odd index) are the top row; column = index/2 pairs A/B, C/D, E/F.
+static void portGridColRow(int port, int* outCol, int* outRow) {
+    *outCol = port / 2;
+    *outRow = (port % 2 == 0) ? 1 : 0;
+}
+
 static void drawPortCell(int port) {
-    int col = port % 3;
-    int row = port / 3;
+    int col, row;
+    portGridColRow(port, &col, &row);
     int16_t x = portCellX(col);
     int16_t y = portCellY(row);
 
@@ -1504,6 +1517,20 @@ static void drawPortSelect() {
         drawPortCell(p);
     }
 
+    // WO20 (rev A): power-button anchor - a small red dot at the left
+    // edge, non-interactive (no touch zone), purely orienting the grid
+    // above/below it as "this is how the hub looks held power-button-
+    // left." Vertically centered on the two-row port grid
+    // (PORT_GRID_Y0 to PORT_GRID_Y0 + 2*PORT_GRID_ROW_H + PORT_GRID_ROW_GAP),
+    // well inside the grid's own left margin - doesn't touch
+    // PORT_GRID_X0 or any button geometry.
+    {
+        int16_t gridTop = PORT_GRID_Y0;
+        int16_t gridBottom = PORT_GRID_Y0 + 2 * PORT_GRID_ROW_H + PORT_GRID_ROW_GAP;
+        int16_t dotCy = (gridTop + gridBottom) / 2;
+        display->fillCircle(10, dotCy, 5, COLOR_RED);
+    }
+
     drawButtonAt(SELECT_BACK_X, SELECT_BACK_Y, SELECT_BACK_W, SELECT_BACK_H, "< BACK");
     drawTestToggle();
 }
@@ -1534,8 +1561,8 @@ static void dispatchPortSelectTouch(int16_t touchX, int16_t touchY) {
     }
 
     for (int p = 0; p < MKH_MK6_NUM_CHANNELS; p++) {
-        int col = p % 3;
-        int row = p / 3;
+        int col, row;
+        portGridColRow(p, &col, &row);
         int16_t x = portCellX(col);
         int16_t y = portCellY(row);
         if (touchX >= x && touchX < x + PORT_GRID_COL_W && touchY >= y && touchY < y + PORT_GRID_ROW_H) {
