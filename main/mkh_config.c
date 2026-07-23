@@ -44,6 +44,7 @@ static const mkh_mode_token_t kModeTokens[] = {
     {"momentary", MKH_MODE_MOMENTARY},
     {"latched", MKH_MODE_LATCHED},
     {"pulse", MKH_MODE_PULSE},
+    {"thl", MKH_MODE_THL},
 };
 #define NUM_MODE_TOKENS (sizeof(kModeTokens) / sizeof(kModeTokens[0]))
 

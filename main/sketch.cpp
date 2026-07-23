@@ -20,6 +20,7 @@
 #include "mkh_imu.h"
 #include "mkh_ports.h"
 #include "mkh_storage.h"
+#include "mkh_thl.h"
 #include "mkh_touch.h"
 
 //
@@ -1053,7 +1054,8 @@ enum StatsLine {
     STATS_LINE_CONFIG,
     STATS_LINE_RATE,
     STATS_LINE_XWC,
-    STATS_LINE_HEADING  // WO15: trivially cheap to add - well clear of the hint text below
+    STATS_LINE_HEADING,  // WO15: trivially cheap to add - well clear of the hint text below
+    STATS_LINE_THL        // WO16: same - still clear of the hint text at Y=210
 };
 static const int16_t STATS_LINE_X = 20;
 static const int16_t STATS_LINE_Y0 = 56;
@@ -1108,6 +1110,11 @@ static void drawStatsPage() {
     snprintf(line, sizeof(line), "HEADING: %s", mkh_imu_ready() ? "..." : "CALIBRATING");
     drawStatsLine(STATS_LINE_HEADING, line);
 
+    // WO16: THL line - real value filled in by updateStatsThl() on the
+    // next per-second tick, same pattern as HEADING above.
+    snprintf(line, sizeof(line), "THL: OFF");
+    drawStatsLine(STATS_LINE_THL, line);
+
     const char* hint = "TAP ANYWHERE TO CONTINUE";
     display->setTextColor(COLOR_LABEL);
     display->setTextSize(1);
@@ -1153,6 +1160,34 @@ static void updateStatsHeading() {
         snprintf(line, sizeof(line), "HEADING: CALIBRATING");
     }
     drawStatsLine(STATS_LINE_HEADING, line);
+}
+
+// WO16: same once-per-second diff-and-redraw pattern, for the THL line -
+// "THL state (OFF / ENGAGED / CALIBRATING-blocked) + current error when
+// engaged" per the order. mkh_thl_set_status() (called from
+// processMappedInputs(), unconditionally every tick) already tracks the
+// current state; this only redraws the on-screen text while the stats
+// page happens to be showing.
+static uint32_t lastStatsThlSec = 0xFFFFFFFF;
+static void updateStatsThl() {
+    uint32_t totalSec = millis() / 1000;
+    if (totalSec == lastStatsThlSec)
+        return;
+    lastStatsThlSec = totalSec;
+
+    char line[48];
+    switch (mkh_thl_status_state()) {
+        case MKH_THL_STATE_ENGAGED:
+            snprintf(line, sizeof(line), "THL: ENGAGED ERR=%.1f DEG", (double)mkh_thl_status_error_deg());
+            break;
+        case MKH_THL_STATE_CALIBRATING_BLOCKED:
+            snprintf(line, sizeof(line), "THL: CALIBRATING");
+            break;
+        default:
+            snprintf(line, sizeof(line), "THL: OFF");
+            break;
+    }
+    drawStatsLine(STATS_LINE_THL, line);
 }
 
 // WO10 Step 1: hub select + port select. Both have custom geometry (not
@@ -1881,21 +1916,24 @@ static const char* modeShortLabel(mkh_input_mode_t mode) {
             return "LATCHED";
         case MKH_MODE_PULSE:
             return "PULSE";
+        case MKH_MODE_THL:
+            return "THL";
         default:
             return "?";
     }
 }
 
-// 3-state cycle for digitals (MOMENTARY->LATCHED->PULSE->... - no
+// 4-state cycle for digitals (MOMENTARY->LATCHED->PULSE->THL->... - no
 // proportional option, order: "buttons/dpad/stick-clicks = momentary
 // (default) | latched", extended by the PULSE WO to add pulse as a
-// third button-class option); 4-state cycle for triggers
-// (PROPORTIONAL->MOMENTARY->LATCHED->PULSE->...) - "triggers-as-buttons"
-// per the PULSE WO's own context line, so triggers get the same third
-// option digitals do, on top of their existing proportional default.
-// Never called for MKH_INPUT_CLASS_AXIS - that row is hidden entirely
-// (order: "hidden/disabled for stick axes"; PULSE WO: "sticks/axes: not
-// offered", same treatment, no new row needed).
+// third button-class option, extended by WO16 to add THL as a fourth);
+// 5-state cycle for triggers (PROPORTIONAL->MOMENTARY->LATCHED->PULSE->
+// THL->...) - "triggers-as-buttons" per the PULSE WO's own context line,
+// so triggers get the same options digitals do, on top of their
+// existing proportional default. Never called for MKH_INPUT_CLASS_AXIS -
+// that row is hidden entirely (order: "hidden/disabled for stick axes";
+// PULSE WO and WO16 both: "sticks/axes: not offered", same treatment, no
+// new row needed).
 static mkh_input_mode_t nextModeFor(mkh_input_class_t cls, mkh_input_mode_t current) {
     if (cls == MKH_INPUT_CLASS_TRIGGER) {
         switch (current) {
@@ -1905,6 +1943,8 @@ static mkh_input_mode_t nextModeFor(mkh_input_class_t cls, mkh_input_mode_t curr
                 return MKH_MODE_LATCHED;
             case MKH_MODE_LATCHED:
                 return MKH_MODE_PULSE;
+            case MKH_MODE_PULSE:
+                return MKH_MODE_THL;
             default:
                 return MKH_MODE_PROPORTIONAL;
         }
@@ -1914,6 +1954,8 @@ static mkh_input_mode_t nextModeFor(mkh_input_class_t cls, mkh_input_mode_t curr
             return MKH_MODE_LATCHED;
         case MKH_MODE_LATCHED:
             return MKH_MODE_PULSE;
+        case MKH_MODE_PULSE:
+            return MKH_MODE_THL;
         default:
             return MKH_MODE_MOMENTARY;
     }
@@ -2755,6 +2797,16 @@ static bool pulseActive[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDI
 static uint32_t pulseStartFrame[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDINGS_PER_PORT];
 static bool pulsePrevPressed[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDINGS_PER_PORT];
 
+// WO16: THL (Turret Heading-Lock) per-binding state - same array shape
+// as latchState/pulseArmed above, same reason (a port can carry several
+// bindings, only one of which may be THL, but sized uniformly regardless).
+// thlEngaged/thlReferenceDeg persist across ticks while engaged;
+// thlPrevPressed is the press-edge detector (toggles on the edge, not
+// the level, same as LATCHED's own thlPrevPressed-shaped array).
+static bool thlEngaged[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDINGS_PER_PORT];
+static float thlReferenceDeg[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDINGS_PER_PORT];
+static bool thlPrevPressed[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_BINDINGS_PER_PORT];
+
 // WO11 Task 4 (hardening), extended WO13, extended WO PULSE: reassigning
 // a port away from latched/pulse mode and back again via the editor
 // could otherwise resurface stale state from before the reassignment - a
@@ -2777,6 +2829,12 @@ static bool pulsePrevPressed[MKH_MK6_NUM_DEVICES][MKH_MK6_NUM_CHANNELS][MKH_MAX_
 // disconnect, immediately after neutralizing every assigned channel - an
 // active pulse's internal bookkeeping is cleared in that same sweep, so a
 // reconnect can never resume mid-pulse.
+//
+// WO16: now also clears THL engage state, same reasoning again -
+// disconnect/reassignment/RESET ALL must never leave a stale engaged
+// lock (with a now-meaningless captured reference) behind. A disconnect
+// mid-lock therefore disengages it exactly like PULSE's mid-pulse
+// truncation, "for free" from this same existing call site.
 static void clearLatchStateForPort(int dev, int port) {
     for (int b = 0; b < MKH_MAX_BINDINGS_PER_PORT; b++) {
         latchState[dev][port][b] = false;
@@ -2786,6 +2844,9 @@ static void clearLatchStateForPort(int dev, int port) {
         pulseActive[dev][port][b] = false;
         pulseStartFrame[dev][port][b] = 0;
         pulsePrevPressed[dev][port][b] = false;
+        thlEngaged[dev][port][b] = false;
+        thlReferenceDeg[dev][port][b] = 0.0f;
+        thlPrevPressed[dev][port][b] = false;
     }
 }
 
@@ -2891,6 +2952,23 @@ static void processMappedInputs(ControllerPtr ctl) {
             // +127/-128 clamp band used below, so "clamp to +/-100%"
             // needs no separate percent conversion.
             int sumDelta = 0;
+
+            // WO16 Step 4, v2 (cruise-control model, spec amendment -
+            // supersedes plain suppression): every binding's natural
+            // rawByte is computed unconditionally below (Pass 1) - side
+            // effects like LATCHED's toggle or PULSE's state machine
+            // always advance regardless of an active THL lock, so
+            // nothing on this port goes stale while suppressed. Whether
+            // a non-THL binding's computed value actually reaches the
+            // port is decided after the fact (Pass 2): if THL is
+            // engaged here and a sibling's deflection exceeds the
+            // cancel threshold, the lock cancels THIS tick and that
+            // binding's already-computed value flows straight through
+            // (no neutral gap, no rate limit); otherwise, if the lock
+            // is still held, every non-THL sibling is zeroed before
+            // summing (Pass 3).
+            uint8_t rawBytes[MKH_MAX_BINDINGS_PER_PORT];
+
             for (int bIdx = 0; bIdx < cfg->binding_count; bIdx++) {
                 const mkh_binding_t* binding = &cfg->bindings[bIdx];
                 mkh_input_class_t cls = mkh_config_input_class(binding->input);
@@ -2963,6 +3041,58 @@ static void processMappedInputs(ControllerPtr ctl) {
                         }
 
                         rawByte = pulseActive[dev][port][bIdx] ? 0xFF : 0x80;
+                    } else if (binding->mode == MKH_MODE_THL) {
+                        // WO16: press toggles engage/disengage. Engage
+                        // captures the current integrated heading as the
+                        // reference and is refused (logged, status shows
+                        // CALIBRATING) while the IMU is still in its boot
+                        // calibration window - never a silent failure.
+                        bool isNewPress = pressed && !thlPrevPressed[dev][port][bIdx];
+                        thlPrevPressed[dev][port][bIdx] = pressed;
+
+                        if (isNewPress) {
+                            if (thlEngaged[dev][port][bIdx]) {
+                                thlEngaged[dev][port][bIdx] = false;
+                                Console.printf("MK1 THL: dev=%d port=%c[%d] DISENGAGED\n", dev,
+                                               mkh_port_letter(port), bIdx);
+                                mkh_thl_set_status(MKH_THL_STATE_OFF, 0.0f, 0.0f);
+                            } else if (!mkh_imu_ready()) {
+                                Console.printf(
+                                    "MK1 THL: dev=%d port=%c[%d] engage REFUSED - IMU still calibrating\n", dev,
+                                    mkh_port_letter(port), bIdx);
+                                mkh_thl_set_status(MKH_THL_STATE_CALIBRATING_BLOCKED, 0.0f, 0.0f);
+                            } else {
+                                thlEngaged[dev][port][bIdx] = true;
+                                thlReferenceDeg[dev][port][bIdx] = mkh_imu_heading_deg();
+                                Console.printf("MK1 THL: dev=%d port=%c[%d] ENGAGED, reference=%.2f deg\n", dev,
+                                               mkh_port_letter(port), bIdx, thlReferenceDeg[dev][port][bIdx]);
+                            }
+                        }
+
+                        if (thlEngaged[dev][port][bIdx]) {
+                            float errorDeg = 0.0f;
+                            float outputPct = mkh_thl_compute_output_pct(thlReferenceDeg[dev][port][bIdx],
+                                                                          mkh_imu_heading_deg(), &errorDeg);
+                            int delta = (int)lroundf((outputPct / 100.0f) * 127.0f);
+                            int value = 0x80 + delta;
+                            if (value > 0xFF)
+                                value = 0xFF;
+                            if (value < 0x00)
+                                value = 0x00;
+                            rawByte = (uint8_t)value;
+                            mkh_thl_set_status(MKH_THL_STATE_ENGAGED, errorDeg, outputPct);
+                        } else {
+                            rawByte = 0x80;
+                            // Self-correcting every idle tick (not just on a
+                            // refused press) - proactive feedback while the
+                            // boot calibration window is open, AND the
+                            // transition back to OFF once mkh_imu_ready()
+                            // flips true with no engage attempted yet
+                            // (otherwise the status would stick at
+                            // CALIBRATING forever after boot cal completes).
+                            mkh_thl_set_status(mkh_imu_ready() ? MKH_THL_STATE_OFF : MKH_THL_STATE_CALIBRATING_BLOCKED,
+                                                0.0f, 0.0f);
+                        }
                     } else {
                         // MOMENTARY - the only other legal mode for a
                         // digital; for a trigger, the explicit momentary case.
@@ -2970,7 +3100,62 @@ static void processMappedInputs(ControllerPtr ctl) {
                     }
                 }
 
-                uint8_t finalByte = mkApplyBindingConfig(rawByte, binding);
+                rawBytes[bIdx] = rawByte;
+            }
+
+            // Pass 2: cancel-check + suppression. Locate an engaged THL
+            // binding on this port (same "one at a time" assumption v1
+            // documented - realistic use has at most one). If found,
+            // check every OTHER binding's just-computed natural value
+            // for manual-override-worthy deflection before deciding
+            // whether to suppress or cancel.
+            int thlBindingIdx = -1;
+            for (int b = 0; b < cfg->binding_count; b++) {
+                if (cfg->bindings[b].mode == MKH_MODE_THL && thlEngaged[dev][port][b]) {
+                    thlBindingIdx = b;
+                    break;
+                }
+            }
+
+            if (thlBindingIdx >= 0) {
+                float cancelThresholdPct = mkh_thl_cancel_threshold_pct();
+                int cancellingBIdx = -1;
+                for (int b = 0; b < cfg->binding_count; b++) {
+                    if (b == thlBindingIdx)
+                        continue;
+                    int delta = (int)rawBytes[b] - 0x80;
+                    float pct = fabsf((float)delta) / 127.0f * 100.0f;
+                    if (pct > cancelThresholdPct) {
+                        cancellingBIdx = b;
+                        break;
+                    }
+                }
+
+                if (cancellingBIdx >= 0) {
+                    // Manual override - cancel immediately, same tick,
+                    // no neutral gap: the cancelling binding's
+                    // already-computed rawBytes[] entry is left as-is
+                    // and will flow through Pass 3 normally below; only
+                    // the just-cancelled THL binding's own slot is
+                    // forced to neutral for this tick.
+                    thlEngaged[dev][port][thlBindingIdx] = false;
+                    rawBytes[thlBindingIdx] = 0x80;
+                    Console.printf("MK1 THL: dev=%d port=%c[%d] DISENGAGED (manual override)\n", dev,
+                                   mkh_port_letter(port), thlBindingIdx);
+                    mkh_thl_set_status(MKH_THL_STATE_OFF, 0.0f, 0.0f);
+                } else {
+                    // Still locked - every other binding on this port is
+                    // suppressed (contributes neutral) this tick.
+                    for (int b = 0; b < cfg->binding_count; b++) {
+                        if (b != thlBindingIdx)
+                            rawBytes[b] = 0x80;
+                    }
+                }
+            }
+
+            // Pass 3: apply invert/max and sum, unchanged from before.
+            for (int bIdx = 0; bIdx < cfg->binding_count; bIdx++) {
+                uint8_t finalByte = mkApplyBindingConfig(rawBytes[bIdx], &cfg->bindings[bIdx]);
                 sumDelta += (int)finalByte - 0x80;
             }
 
@@ -3668,6 +3853,14 @@ void loop() {
     // control behavior (out of scope per the order).
     mkh_imu_poll();
 
+    // WO16: live serial tuning (thl deadband/kp/floor/ceiling <value>)
+    // and the THL 1Hz status line - same "unconditional, internally
+    // gated" pattern as the two calls above. Serial tuning must run
+    // every tick regardless of page so bench tuning isn't tied to
+    // whatever's on screen.
+    mkh_thl_poll_serial_tuning();
+    mkh_thl_log_status_1hz();
+
     // WO10 Step 0: touch dispatch is now page-aware. The dashboard's hit
     // zones (settings button + MKH rows, debounce, transition lockout)
     // apply ONLY in PAGE_DASHBOARD; editor pages use dispatchEditorTouch()
@@ -3845,6 +4038,7 @@ void loop() {
     } else if (currentPage == PAGE_STATS) {
         updateStatsUptime();
         updateStatsHeading();
+        updateStatsThl();
     } else if (currentPage == PAGE_IDLE) {
         // WO11 Task 3: lightweight periodic redraw (see
         // updateIdleAnimation()'s doc comment) plus the XWC-connect wake -

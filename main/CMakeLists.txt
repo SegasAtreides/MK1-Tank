@@ -5,6 +5,7 @@ set(srcs
         "mkh_imu.cpp"
         "mkh_protocol.c"
         "mkh_storage.cpp"
+        "mkh_thl.cpp"
         "mkh_touch.cpp"
         "sketch.cpp")
 # mkh_sdcard.cpp is intentionally NOT built - the microSD card is retired

@@ -98,11 +98,22 @@ mkh_input_class_t mkh_config_input_class(mkh_input_source_t input);
 // uniformly (see mkh_config_parse_line()'s doc comment), it's simply
 // never consulted for MKH_INPUT_CLASS_AXIS at drive time; the "sticks:
 // not offered" restriction is editor-UI-only, per the order.
+// WO16: adds MKH_MODE_THL (Turret Heading-Lock) - a fourth button-class
+// mode. Press toggles engage/disengage: engage captures the current
+// integrated heading (mkh_imu_heading_deg()) as a reference and holds
+// it via a P-only control loop (error = reference - heading, CW-from-
+// above positive - see sketch.cpp's THL control law); disengage returns
+// to free traverse. Engage is refused (logged, not silent) while the
+// IMU is still in its boot calibration window (mkh_imu_ready()==false).
+// Same "opt-in only, button-class only" treatment as LATCHED/PULSE -
+// default_mode_for_input() never resolves to it, and the parser accepts
+// mode=thl for any token uniformly (editor-UI-only restriction).
 typedef enum {
     MKH_MODE_PROPORTIONAL = 0,
     MKH_MODE_MOMENTARY,
     MKH_MODE_LATCHED,
     MKH_MODE_PULSE,
+    MKH_MODE_THL,
 } mkh_input_mode_t;
 
 // WO13: a port carries up to this many bindings. Soft cap - trivially
