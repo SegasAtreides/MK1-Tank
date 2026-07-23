@@ -7,6 +7,8 @@
       "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
       "Bash(git add:*)", "Bash(git commit:*)", "Bash(git tag:*)",
       "Bash(grep:*)", "Bash(find:*)",
+      "Bash(git show:*)", "Bash(git rev-list:*)",
+      "Bash(git config --local --list:*)", "Bash(pio pkg list:*)",
       "Edit", "Write"
     ],
     "deny": [
