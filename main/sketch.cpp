@@ -2034,6 +2034,16 @@ static uint8_t applyMaxEndSnap(int32_t percent) {
 static void drawSettingsMaxRow() {
     display->fillRect(0, SPAGE_MAXSLIDER_Y, SCR_W, SPAGE_MAXSLIDER_H, COLOR_BG);
 
+    // WO22: max% is meaningless for THL bindings (the loop's own floor/
+    // ceiling are calibrated absolutes that bypass this scale entirely
+    // - see mkApplyBindingConfig()) - hidden entirely, same "hidden
+    // rather than shown-but-inert" treatment as the mode row's own
+    // AXIS-class hiding above. The row is simply left blank; no other
+    // row moves to fill the space (matching that same precedent).
+    if (settingsWorkingMode == MKH_MODE_THL) {
+        return;
+    }
+
     // Nudge buttons - full 40x40 targets, same visual language as the
     // page's other buttons (drawButtonAt: bordered box, centered label).
     drawButtonAt(SPAGE_NUDGE_MINUS_X, SPAGE_MAXSLIDER_Y, SPAGE_NUDGE_W, SPAGE_MAXSLIDER_H, "-");
@@ -2284,8 +2294,13 @@ static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
     }
 
     // WO13 Task 2: nudge buttons, 1% per tap, end-snap applied same as a
-    // drag release (see applyMaxEndSnap()).
-    bool inMaxRow = touchY >= SPAGE_MAXSLIDER_Y && touchY < SPAGE_MAXSLIDER_Y + SPAGE_MAXSLIDER_H;
+    // drag release (see applyMaxEndSnap()). WO22: the row is hidden
+    // entirely for THL bindings (see drawSettingsMaxRow()) - gating
+    // inMaxRow itself on mode, rather than each branch below
+    // individually, means a stray tap in that blank band can't silently
+    // change a value the operator can no longer see.
+    bool inMaxRow = touchY >= SPAGE_MAXSLIDER_Y && touchY < SPAGE_MAXSLIDER_Y + SPAGE_MAXSLIDER_H &&
+                     settingsWorkingMode != MKH_MODE_THL;
     if (inMaxRow && touchX >= SPAGE_NUDGE_MINUS_X && touchX < SPAGE_NUDGE_MINUS_X + SPAGE_NUDGE_W) {
         settingsWorkingMax = applyMaxEndSnap((int32_t)settingsWorkingMax - 1);
         Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings MAX nudge- -> %u%%\n", touchX, touchY,
@@ -2710,6 +2725,18 @@ static uint8_t mkApplyBindingConfig(uint8_t rawByte, const mkh_binding_t* b) {
             value = 0xFF;
         if (value < 0x00)
             value = 0x00;
+    }
+
+    // WO22: THL's loop output (floor..ceiling) is a calibrated absolute,
+    // not a proportional stick/trigger reading - scaling it by the
+    // binding's own max% could push it below motor breakaway (e.g.
+    // max=60% * floor=15% = 9%, stalls, lock inoperative). Skip the
+    // max% scale for THL bindings entirely; invert above still applies
+    // - it's the legitimate per-port direction-correction mechanism,
+    // unaffected by this bypass. Every other mode's max% behavior is
+    // unchanged - the scale below still runs for all of them.
+    if (b->mode == MKH_MODE_THL) {
+        return (uint8_t)value;
     }
 
     int delta = value - 0x80;
