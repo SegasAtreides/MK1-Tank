@@ -1950,60 +1950,52 @@ static const char* modeShortLabel(mkh_input_mode_t mode) {
     }
 }
 
-// 4-state cycle for digitals (MOMENTARY->LATCHED->PULSE->THL->... - no
-// proportional option, order: "buttons/dpad/stick-clicks = momentary
-// (default) | latched", extended by the PULSE WO to add pulse as a
-// third button-class option, extended by WO16 to add THL as a fourth);
-// 5-state cycle for triggers (PROPORTIONAL->MOMENTARY->LATCHED->PULSE->
-// THL->...) - "triggers-as-buttons" per the PULSE WO's own context line,
-// so triggers get the same options digitals do, on top of their
-// existing proportional default. Never called for MKH_INPUT_CLASS_AXIS -
-// that row is hidden entirely (order: "hidden/disabled for stick axes";
-// PULSE WO and WO16 both: "sticks/axes: not offered", same treatment, no
-// new row needed).
-static mkh_input_mode_t nextModeFor(mkh_input_class_t cls, mkh_input_mode_t current) {
-    if (cls == MKH_INPUT_CLASS_TRIGGER) {
-        switch (current) {
-            case MKH_MODE_PROPORTIONAL:
-                return MKH_MODE_MOMENTARY;
-            case MKH_MODE_MOMENTARY:
-                return MKH_MODE_LATCHED;
-            case MKH_MODE_LATCHED:
-                return MKH_MODE_PULSE;
-            case MKH_MODE_PULSE:
-                return MKH_MODE_THL;
-            default:
-                return MKH_MODE_PROPORTIONAL;
-        }
-    }
+// WO23 (PM product ruling, standing): one universal 5-state cycle for
+// EVERY binding regardless of input class - Proportional->Momentary->
+// Latched->Pulse->THL->Proportional. Supersedes the old per-class
+// branch (digital: 4-state, no proportional; trigger: 5-state; axis:
+// hidden entirely) - that split was the root of WO20(b)'s traced
+// defect (bindings landing in a mode their own class's ring could
+// never cycle back to). No input class skips any mode; no class is
+// even consulted here anymore. What each mode actually DOES for a
+// given input class is entirely a drive-time question
+// (processMappedInputs(), untouched by this WO) - this function only
+// governs which mode value the UI cycles to next.
+static mkh_input_mode_t nextModeFor(mkh_input_mode_t current) {
     switch (current) {
+        case MKH_MODE_PROPORTIONAL:
+            return MKH_MODE_MOMENTARY;
         case MKH_MODE_MOMENTARY:
             return MKH_MODE_LATCHED;
         case MKH_MODE_LATCHED:
             return MKH_MODE_PULSE;
         case MKH_MODE_PULSE:
             return MKH_MODE_THL;
-        default:
-            return MKH_MODE_MOMENTARY;
+        default:  // MKH_MODE_THL
+            return MKH_MODE_PROPORTIONAL;
     }
 }
 
 // WO10-FINAL rev B mode control: CC's widget judgment (reported) - a
 // single "tap row to cycle" control showing the current mode as text,
-// used for BOTH the 2-state (digital) and 3-state (trigger) cases
-// rather than a true graphical pill/segmented-control, since a plain
-// on/off pill has no natural 3-position analogue and building two
-// different widget shapes for what's functionally the same interaction
-// (tap, see the next state) wasn't worth the extra code. Hidden
-// entirely for MKH_INPUT_CLASS_AXIS ports - "no mode" is represented by
-// the row simply not existing, not a disabled-but-visible state.
+// used uniformly for every input class - a plain on/off pill has no
+// natural 5-position analogue and building a different widget shape
+// per class wasn't worth the extra code even before WO23.
+//
+// WO23: no longer hidden for MKH_INPUT_CLASS_AXIS - "every binding,
+// every input class, displays its current mode and cycles the full
+// ring by tap... explicitly including stick-axis bindings" (order's own
+// wording). The row is now unconditional; what setting a non-
+// proportional mode on an axis binding actually DOES is a drive-time
+// question this WO deliberately does not touch (processMappedInputs()
+// still never consults binding->mode for MKH_INPUT_CLASS_AXIS - see its
+// own doc comment) - the mode is fully settable and displayed, and the
+// resulting no-op-in-practice behavior is exactly the "emergent
+// oddity... not a gap to fill" the order calls for, not a bug.
 static void drawSettingsModeRow() {
     int16_t x = SPAGE_TOGGLE_MID_X;
     int16_t w = SCR_W - SPAGE_TOGGLE_MID_X;
     display->fillRect(x, SPAGE_TOGGLE_ROW_Y, w, SPAGE_TOGGLE_ROW_H, COLOR_BG);
-    if (mkh_config_input_class(editCtx.captured_input) == MKH_INPUT_CLASS_AXIS) {
-        return;  // hidden entirely for stick axes - "no mode" is the row not existing
-    }
     char line[24];
     snprintf(line, sizeof(line), "MODE: %s", modeShortLabel(settingsWorkingMode));
     display->drawRect(x + 4, SPAGE_TOGGLE_ROW_Y + 2, w - 8, SPAGE_TOGGLE_ROW_H - 4, COLOR_CARD_BORDER);
@@ -2231,7 +2223,10 @@ static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
     int dev = editCtx.selected_device;
     int port = editCtx.selected_port;
     int idx = editCtx.editing_binding_index;
-    mkh_input_class_t cls = mkh_config_input_class(editCtx.captured_input);
+    // WO23: cls (mkh_config_input_class(editCtx.captured_input)) is no
+    // longer needed here - the mode row and its tap handler are
+    // unconditional for every input class now (see drawSettingsModeRow()
+    // and nextModeFor()'s own doc comments).
     // WO13: BACK's destination (and the KEEP/DISCARD prompt's) depends
     // on how this settings visit was reached - see settingsBackToCapture's
     // doc comment.
@@ -2285,8 +2280,8 @@ static void dispatchSettingsTouch(int16_t touchX, int16_t touchY) {
         drawSettingsInvertRow();
         return;
     }
-    if (inToggleRow && touchX >= SPAGE_TOGGLE_MID_X && cls != MKH_INPUT_CLASS_AXIS) {
-        settingsWorkingMode = nextModeFor(cls, settingsWorkingMode);
+    if (inToggleRow && touchX >= SPAGE_TOGGLE_MID_X) {
+        settingsWorkingMode = nextModeFor(settingsWorkingMode);
         Console.printf("MK1 Touch: tap display=(x=%d,y=%d) -> settings MODE -> %s\n", touchX, touchY,
                         modeShortLabel(settingsWorkingMode));
         drawSettingsModeRow();
