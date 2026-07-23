@@ -24,18 +24,22 @@ typedef enum {
     MKH_THL_STATE_CALIBRATING_BLOCKED,
 } mkh_thl_state_t;
 
-// Compiled defaults, WO17 bake (bench-tuned and confirmed on the
-// assembled turret; WO16's original ceiling=60% is the one value that
-// moved - bench-ruled insufficient: the lock must be able to counter-
-// rotate at full hull yaw rate during pivots, which needs the full
-// +/-100% manual-traverse authority the port otherwise has, not a 60%-
-// capped subset of it). deadband=2.0deg, Kp=3%/deg, floor=15%: bench-
-// confirmed unchanged from WO16. Live-tunable below - these are only
-// the boot-time starting point, not read again after boot.
+// Compiled defaults, WO21 revert (back to WO16's original ceiling).
+// WO17 raised ceiling to 100% for full counter-rotation authority
+// during pivots; WO19's field defect (sustained, non-decaying THL
+// oscillation) was bench-convicted at ceiling=100% as a floor-deadband
+// limit cycle - not a code defect (WO19's inspection and trace stand as
+// the exonerating evidence; wrap180() below is correct and kept, it
+// simply wasn't the cause). Live serial confirmation (`thl ceiling 60`)
+// made the oscillation stop. Reverted here to the known-good ceiling;
+// rate-damping (a PD term) is parked as a known lever for a future
+// campaign rather than attempted under this WO's P-only constraint.
+// deadband=2.0deg, Kp=3%/deg, floor=15%: unchanged. Live-tunable below -
+// these are only the boot-time starting point, not read again after boot.
 #define MKH_THL_DEFAULT_DEADBAND_DEG 2.0f
 #define MKH_THL_DEFAULT_KP_PCT_PER_DEG 3.0f
 #define MKH_THL_DEFAULT_FLOOR_PCT 15.0f
-#define MKH_THL_DEFAULT_CEILING_PCT 100.0f
+#define MKH_THL_DEFAULT_CEILING_PCT 60.0f
 
 // Exclusivity v2 (spec amendment, cruise-control model - supersedes
 // WO16 Step 4's plain suppression): manual traverse input on the THL

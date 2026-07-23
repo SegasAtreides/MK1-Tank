@@ -122,8 +122,27 @@ void mkh_thl_poll_serial_tuning(void) {
     }
 }
 
+// WO19 Part C (PM ruling, mandatory regardless of which suspect
+// convicted): shortest-path angular difference, wrapped into (-180,
+// +180]. Continuous-rotation turret, no cables across the ring -
+// correction always takes the shortest angular route. The ONLY
+// normalization point anywhere in the THL/IMU path - integrated
+// heading and captured reference stay raw and unbounded (WO15's own
+// design), never wrapped or reset by this function.
+static float wrap180(float deg) {
+    deg = fmodf(deg, 360.0f);  // now in (-360, 360)
+    if (deg > 180.0f)
+        deg -= 360.0f;
+    else if (deg <= -180.0f)
+        deg += 360.0f;
+    return deg;
+}
+
 float mkh_thl_compute_output_pct(float referenceDeg, float headingDeg, float* outErrorDeg) {
-    float error = referenceDeg - headingDeg;  // CW-from-above positive, per the WO16 ruling
+    // CW-from-above positive, per the WO16 ruling. wrap180() applied
+    // immediately after the subtraction, before deadband/Kp/floor/
+    // ceiling - see its own doc comment above.
+    float error = wrap180(referenceDeg - headingDeg);
     if (outErrorDeg)
         *outErrorDeg = error;
 
