@@ -2,6 +2,7 @@ set(srcs
         "main.c"
         "mkh_broadcast.c"
         "mkh_config.c"
+        "mkh_imu.cpp"
         "mkh_protocol.c"
         "mkh_storage.cpp"
         "mkh_touch.cpp"

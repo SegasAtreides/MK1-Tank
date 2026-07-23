@@ -17,6 +17,7 @@
 
 #include "mkh_broadcast.h"
 #include "mkh_config.h"
+#include "mkh_imu.h"
 #include "mkh_ports.h"
 #include "mkh_storage.h"
 #include "mkh_touch.h"
@@ -1046,7 +1047,14 @@ static void updateIdleAnimation() {
 // once-per-second UPTIME-line-only refresh, piggybacked on loop()'s
 // existing cadence, no new timer machinery). Holds until tapped -
 // dispatch lives in loop(), not here.
-enum StatsLine { STATS_LINE_FW = 0, STATS_LINE_UPTIME, STATS_LINE_CONFIG, STATS_LINE_RATE, STATS_LINE_XWC };
+enum StatsLine {
+    STATS_LINE_FW = 0,
+    STATS_LINE_UPTIME,
+    STATS_LINE_CONFIG,
+    STATS_LINE_RATE,
+    STATS_LINE_XWC,
+    STATS_LINE_HEADING  // WO15: trivially cheap to add - well clear of the hint text below
+};
 static const int16_t STATS_LINE_X = 20;
 static const int16_t STATS_LINE_Y0 = 56;
 static const int16_t STATS_LINE_GAP = 18;
@@ -1094,6 +1102,12 @@ static void drawStatsPage() {
     snprintf(line, sizeof(line), "XWC: %s", xwcState == XWC_ACTIVE ? "CONNECTED" : "NOT CONNECTED");
     drawStatsLine(STATS_LINE_XWC, line);
 
+    // WO15: HEADING line - "CALIBRATING" until mkh_imu_ready() (boot bias
+    // calibration is still running or bring-up failed); the real value
+    // is filled in by updateStatsHeading() on the next per-second tick.
+    snprintf(line, sizeof(line), "HEADING: %s", mkh_imu_ready() ? "..." : "CALIBRATING");
+    drawStatsLine(STATS_LINE_HEADING, line);
+
     const char* hint = "TAP ANYWHERE TO CONTINUE";
     display->setTextColor(COLOR_LABEL);
     display->setTextSize(1);
@@ -1118,6 +1132,27 @@ static void updateStatsUptime() {
     char line[48];
     snprintf(line, sizeof(line), "UPTIME: %s", uptimeBuf);
     drawStatsLine(STATS_LINE_UPTIME, line);
+}
+
+// WO15: same once-per-second diff-and-redraw pattern as
+// updateStatsUptime() above, for the HEADING line. mkh_imu_poll() (called
+// unconditionally every loop() tick, regardless of page) already does the
+// actual sampling/integration/serial-logging - this only redraws the
+// on-screen text while the stats page happens to be showing.
+static uint32_t lastStatsHeadingSec = 0xFFFFFFFF;
+static void updateStatsHeading() {
+    uint32_t totalSec = millis() / 1000;
+    if (totalSec == lastStatsHeadingSec)
+        return;
+    lastStatsHeadingSec = totalSec;
+
+    char line[48];
+    if (mkh_imu_ready()) {
+        snprintf(line, sizeof(line), "HEADING: %.1f DEG", (double)mkh_imu_heading_deg());
+    } else {
+        snprintf(line, sizeof(line), "HEADING: CALIBRATING");
+    }
+    drawStatsLine(STATS_LINE_HEADING, line);
 }
 
 // WO10 Step 1: hub select + port select. Both have custom geometry (not
@@ -3416,6 +3451,13 @@ void setup() {
     // reasons; placed here to group peripheral bring-up together.
     mkh_touch_init();
 
+    // WO15: QMI8658 IMU bring-up - MUST come after mkh_touch_init()
+    // above, since it shares that same I2C bus and relies on touch
+    // having already called Wire.begin() (see mkh_imu.cpp's own doc
+    // comment). Blocks for ~1.2s (gyro turn-on + boot bias calibration)
+    // before returning.
+    mkh_imu_init();
+
     initDisplay();
 
     // WO11: splash goes up the moment the display is ready, then boot
@@ -3617,6 +3659,15 @@ void loop() {
     // initDashboard()/updateDashboard().
     updateBatteryReading();
 
+    // WO15: gyro poll + heading integration - runs every tick regardless
+    // of page, matching updateBatteryReading()'s own "unconditional call,
+    // internally gated" pattern. Must run every tick (not gated to
+    // PAGE_STATS) so the elapsed-time-per-sample integration this WO
+    // exists to characterize isn't itself distorted by skipped ticks
+    // while other pages are shown. Read/integrate/display only - no
+    // control behavior (out of scope per the order).
+    mkh_imu_poll();
+
     // WO10 Step 0: touch dispatch is now page-aware. The dashboard's hit
     // zones (settings button + MKH rows, debounce, transition lockout)
     // apply ONLY in PAGE_DASHBOARD; editor pages use dispatchEditorTouch()
@@ -3793,6 +3844,7 @@ void loop() {
         updateDashboard();
     } else if (currentPage == PAGE_STATS) {
         updateStatsUptime();
+        updateStatsHeading();
     } else if (currentPage == PAGE_IDLE) {
         // WO11 Task 3: lightweight periodic redraw (see
         // updateIdleAnimation()'s doc comment) plus the XWC-connect wake -
